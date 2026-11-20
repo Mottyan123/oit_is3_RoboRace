@@ -31,7 +31,7 @@ MAX_RECOVERIES = 3  # 同じコース段階での復帰試行回数の上限。�
 PASS_CLEAR_SECONDS = 0.4  # 物体が側方に抜け始めてから、通過と判断するまでの最低時間（秒）。
 OBSTACLE_CLEARANCE_X = 0.08  # 緑円柱の外縁から取る余裕。初期値は目前の接触判定と同じく中央の左右8%。
 OBSTACLE_PASS_BOTTOM = 0.90  # 横に十分離れた円柱の下端がこの高さを超えたら、通過の確認を始める。
-CONE_SIDE_MARGIN_X = 0.16  # コーンの外縁から確保する横方向の余裕。画像幅に対する割合。
+CONE_SIDE_MARGIN_X = 0.05  # コーンの外縁と進路中心の余裕。画像幅の12%。小さいほどコース中央寄りを通る。
 CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する最低時間（秒）。SLOW_DUTYで試走して調整する。
 
 # ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
@@ -336,7 +336,7 @@ class RaceController:
                 if not (near and clear_side):
                     self.stage = "CENTER_PASS"
                     self.reason = "指定側でコーンに進入"
-                    # 進入時の余裕幅は従来と同じ。余裕がある場合はコーン側へ切り込まない。
+                    # 指定側へ必要な分だけ曲がり、設定した余裕が取れたら直進する。
                     x = 0.5 if clear_side else min(0.92, max(0.08, boundary))
                     return self._drive_toward(x, SLOW_DUTY)
                 self._change_stage("CENTER_CLEAR", now)
@@ -357,7 +357,10 @@ class RaceController:
                 self._change_stage("FAR_OBSTACLE", now)
                 return 0.0, 0.0  # 次の画像から奥の障害物に向けて操舵する。
 
-        self.reason = "コーンの横を直進。車体後部が抜けるまで進路を維持"
+        if cone is not None:
+            self.reason = "コーンの横を直進。車体後部が抜けるまで進路を維持"
+        else:
+            self.reason = "コーンが視野外。後部が抜けるまで直進"
         return self._drive_toward(0.5, SLOW_DUTY)
 
     def _search(self, now):
