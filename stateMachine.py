@@ -1,5 +1,7 @@
-"""競技の段階・キー操作・停止条件を管理する。GPIOはここでは操作しない。"""
+"""キー入力と画像の認識結果から、競技の進行段階と左右のPWMを決める。"""
+
 import math
+
 import numpy as np
 
 # 基本動作の識別番号。順に停止・前進・後退・右旋回・左旋回を表す。
@@ -10,13 +12,13 @@ IDLE, FORWARD, BACKWARD, RIGHT, LEFT = 0, 1, 2, 3, 4
 RACE_SECONDS = 180.0  # 競技の制限時間。
 STOP_MARGIN = 0.2  # 監視周期や車体が止まるまでの遅れを見込んで早めに止める時間。
 
-# モータへのPWM指令。0～100%のデューティ比で、実際の速度は機体によって異なる。
-# 走行用の値は低速試走の初期値。実機で動き出す最低PWMも確認して調整する。
+# PWMのデューティ比は、モータに電圧をかける時間の割合（0～100%）。
+# 同じ指令でも実際の速度は機体によって異なる。
 DRIVE_DUTY = 100.0  # 自律走行で通常前進するときの基本PWM（%）。
 SLOW_DUTY = 100.0  # 障害物回避・ゴール接近・復帰時の短い後退に使うPWM（%）。
 TURN_DUTY = 100.0  # 左右のモータを逆向きに回す旋回のPWM（%）。手動と自律で共通。
 MANUAL_DUTY = 100.0  # 手動で前進・後退するときのPWM（%）。
-STEER_GAIN = 10.0  # 目標の横ずれが最大のとき、片側に足し引きするPWMのポイント数。大きいほど強く曲がる。
+STEER_GAIN = 10.0  # 通常の操舵の強さ。値を上げると左右のPWM差が大きくなる。
 FIXED_AVOID_STEER_GAIN = 35.0  # 円柱・コーンへ寄る前に方向を変えるための操舵ゲイン（PWMのポイント数）。
 FIXED_AVOID_TIGHT_BOTTOM = 0.78  # 物体の下端が画像高の78%以上で、まだ操舵が必要なら小回りへ切り替える。
 FIXED_AVOID_INNER_DUTY_SCALE = 0.35  # 接近時に曲がる内側の履帯のPWM上限。SLOW_DUTYに対する倍率。
@@ -24,9 +26,10 @@ MAX_DUTY = 100.0  # 左右それぞれの出力上限（%）。手動時の出�
 LEFT_TRIM = 0.0  # 自律で目標を追うときの左モータ補正。正なら左PWMを増やす（ポイント）。
 RIGHT_TRIM = 0.0  # 自律で目標を追うときの右モータ補正。正なら右PWMを増やす（ポイント）。
 
-# 画像の有効期限、待機・復帰・通過の設定。
-# 画像の座標は左端・上端を0、右端・下端を1とする。物体の高さや面積も画像全体に対する割合で扱う。
+# 画像の左端と上端が0、右端と下端が1。高さや面積も画像全体に対する比率で扱う。
 IMAGE_MAX_AGE = 0.5  # 画像取得から判断までの許容時間（秒）。最終進入の更新間隔・赤の消失判定にも使う。
+
+# 進路上の相手には停止し、進路のすぐ外にいる相手には減速と操舵で対応する。
 ENEMY_HOLD_SECONDS = 1.0  # 進路を塞いでいた相手を見失った場合に停止を保持する時間（秒）。
 ENEMY_STOP_HALF_WIDTH_X = 0.12  # 予定進路の左右に取る停止判定の幅。車体の分も見込み、画像幅の12%ずつ。
 ENEMY_AVOID_RANGE_X = 0.15  # 停止範囲の外側で低速回避を始める追加幅。画像幅に対する割合。
@@ -36,14 +39,20 @@ ENEMY_MIN_BOTTOM = 0.45  # 黄色の下端が画像の縦45%より上なら除�
 ENEMY_MIN_HEIGHT = 0.06  # 相手機体を判断に使う目印の高さ（画像高の6%）。
 ENEMY_MIN_AREA = 0.004  # 高さが小さくても判断に使う目印の面積（画像全体の0.4%）。
 ENEMY_CLOSE_HEIGHT = 0.23  # 目印がこの高さ以上なら至近距離とみなし、現在の車体正面も停止範囲に含める。
+
+# 目標の探索、障害物による待機、停滞時の復帰。
 SEARCH_SECONDS = 5.0  # 目標を見失ったときに左右を探索する時間の上限（秒）。
 STALL_SECONDS = 2.5  # 前進指令中に移動の証拠が得られず、復帰を試すまでの時間（秒）。
 STATIC_CLEAR_HOLD_SECONDS = 0.2  # 目前の障害物が検出から外れてから、再発進までに空きを確認する時間（秒）。
 MAX_RECOVERIES = 3  # 同じコース段階での復帰試行回数の上限。段階が変わるとリセット。
+
+# 緑の円柱との横の間隔と、車体後部が抜けるまでの時間。
 PASS_CLEAR_SECONDS = 0.4  # 側方の緑円柱を見失った後、通過判定までに必要な前進時間（秒）。
 OBSTACLE_CLEARANCE_X = 0.09  # 発進時・手前の緑円柱の外縁から取る余裕。画像幅の9%。
 FAR_OBSTACLE_CLEARANCE_X = 0.09  # 奥の緑円柱の外縁から取る余裕。画像幅の9%。
 OBSTACLE_PASS_BOTTOM = 0.90  # 横に十分離れた円柱の下端がこの高さを超えたら、通過の確認を始める。
+
+# 中央コーンの追跡と、画面端で見切れた後の通過確認。
 CONE_SIDE_MARGIN_X = 0.07  # コーンの外縁と進路中心の余裕。画像幅の7%。
 CONE_CLEAR_MIN_BOTTOM = 0.82  # コーンの下端が画像高の82%以上に来てから、横を抜ける直進を許す。
 CONE_CLEAR_MIN_HEIGHT = 0.22  # コーンの高さが画像高の22%以上であることも、接近の目安にする。
@@ -59,26 +68,29 @@ CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する�
 # ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
 GOAL_NEAR_AREA = 0.025  # 面積比2.5%。減速と、赤を見失う直前に十分近かったかの判定に使う。
 GOAL_CREEP_AREA = 0.065  # 面積比6.5%。赤が中央付近にあれば微速進入に切り替える。
-# ゴール調整画像1.pngでは台座の下端が画像高の約76%。ここでは黒い台座へ向かって前進を続ける。
+
+# 赤い目印の下に台座を見つけたら、その位置を追う。近づいて正面を向くと最終前進へ移る。
 GOAL_BASE_MATCH_X = 0.10  # 赤い目印の真下、または前の台座位置から許す横ずれ。画像幅の10%。
 GOAL_BASE_MATCH_BOTTOM = 0.15  # 同じ台座として許す下端位置の変化。画像高の15%。
 GOAL_BASE_FINAL_BOTTOM = 0.93  # 台座の下端が画像高の93%以上なら最終前進へ。大きくすると切り替えが遅くなる。
 GOAL_BASE_FINAL_CENTER_X = 0.055  # 最終前進に必要な、台座中心と画像中央の最大ずれ。画像幅の5.5%。
 GOAL_BASE_CONFIRM_FRAMES = 3  # 台座の近さと中央への整列を連続で確認する画像枚数。
 GOAL_BASE_LOSS_SECONDS = 0.6  # 台座を途中で見失った場合、その場で再検出を待つ上限（秒）。
+
 # 黒い台座に機体が重なる位置までの前進時間は、下のPWMで実機を走らせて測る。
 GOAL_FINAL_ADVANCE_SECONDS = 3.0  # 最終前進時間（秒）。台座の手前で止まる場合は延ばす。Noneなら停止。
 GOAL_FINAL_DUTY = 100.0  # 最後に直進するときの基本PWM（%）。前進時間はこのPWMで実測して調整する。
 GOAL_FINAL_MAX_SECONDS = 5.0  # 視野外での前進時間に設定できる上限（秒）。
-# 以前の試走では赤が見えるまま旧6秒の上限に達し、ゴールまで約60cm残った。
-# 進む速さはDUTYとMOVE_SECONDS、台座へ近づく途中で時間切れになる場合はLIMITを調整する。
-GOAL_CREEP_DUTY = 90.0  # 微速進入で前進するときの基本PWM（%）。旧80%から引き上げた。
+
+# 微速進入では短い前進と停止を繰り返す。
+GOAL_CREEP_DUTY = 90.0  # 微速進入で前進するときの基本PWM（%）。
 GOAL_CREEP_LIMIT = 24.0  # 赤や台座を追う微速区間の上限（秒）。観測で停止している時間も含む。
 GOAL_CREEP_PERIOD_SECONDS = 0.35  # 前進と停止を合わせた1周期の長さ（秒）。
 GOAL_CREEP_MOVE_SECONDS = 0.30  # 各周期の前進時間（秒）。伸ばすとよく進む。停止時間を残すため周期未満にする。
 
 
 def _target_x(info):
+    """検出結果の横座標を0～1にそろえる。無効な結果はNoneを返す。"""
     if info is None:
         return None
     if isinstance(info, dict):
@@ -92,7 +104,7 @@ def _target_x(info):
 
 
 def stateMachine(sState, vFlagInfo, vEnemyInfo):
-    """目標の左右から基本動作を選ぶ。無効値の確認を位置判定より先にする。"""
+    """目標の横位置と相手の位置から、基本動作の番号を返す。"""
     x = _target_x(vFlagInfo)
     enemy_x = _target_x(vEnemyInfo)
     if x is None:
@@ -111,9 +123,14 @@ def stateMachine(sState, vFlagInfo, vEnemyInfo):
 
 
 class RaceController:
-    """mode＝操作方法、phase＝開始待ち等、stage＝コースの進行段階。"""
+    """キー入力と画像を受け、競技の状態を保ちながら走行指令を決める。
+
+    modeは手動・自律の区別、phaseは準備や走行中などの状態、
+    stageは障害物やゴールなどコース上の進行段階を表す。
+    """
 
     def __init__(self):
+        # 操作モード、コースの進行状況、走行期限。
         self.mode = 1
         self.phase = "MANUAL"
         self.stage = "START_EXIT"
@@ -123,11 +140,16 @@ class RaceController:
         self.pending_start = None
         self.auto_stopped = False
         self.quit = False
+
+        # 左右のモータへの出力と、画面・ログに表示する判断理由。
         self.command = (0.0, 0.0)  # (左PWM, 右PWM)。負なら後退。
         self.manual_command = self.command
         self.motion = IDLE
         self.reason = "手動: w前進 s後退 a左回転 d右回転 e停止 / 2自律"
+
+        # 画像間の背景の変化を調べ、前進・旋回・停滞を判断する。
         self.stage_entered = None
+        self.last_update_at = None
         self.last_progress = None
         self.last_motion_sample = None
         self.previous_gray = None
@@ -135,20 +157,28 @@ class RaceController:
         self.forward_evidence = 0
         self.last_clear_motion = -math.inf
         self.last_turn = -math.inf
+
+        # 相手や障害物によって一時停止したときの記録。
         self.last_enemy = -math.inf
         self.enemy_until = -math.inf
         self.static_blocked = False
         self.static_clear_since = None
         self.enemies_in_range = []  # 現在の画像で停止・回避の判断に使える黄色い目印。
+
+        # 緑の円柱と青いコーンは、同じ物体を複数の画像にわたって追う。
         self.track = None
         self.cone_track = None
         self.cone_seen_at = None  # 最後に追跡中のコーンを確認した時刻。
         self.cone_side_frames = 0
         self.cone_clear_elapsed = None  # コーンが消えてから直進した時間。Noneは消失をまだ確認していない状態。
         self.cone_evidence_at_loss = 0
+
+        # 目標の探索と、停滞からの復帰。
         self.search_started = None
         self.recovery = None
         self.recoveries = 0
+
+        # 赤い目印と黒い台座の最後の位置、最終前進の記録。
         self.near_goal_confirmations = 0
         self.creep_started = None
         self.last_goal_seen = -math.inf
@@ -160,9 +190,9 @@ class RaceController:
         self.goal_base_confirmations = 0
         self.final_driven_seconds = 0.0
         self.final_deadline = None
-        self.last_update_at = None
 
     def stop(self, reason, terminal=True):
+        """左右を止める。terminalが真なら今回の自律走行を終了する。"""
         self.command = (0.0, 0.0)
         self.manual_command = self.command
         self.reason = reason
@@ -172,6 +202,7 @@ class RaceController:
             self.phase = "STOPPED"
 
     def check_deadline(self, now):
+        """制限時間に達して自律走行を止めたときに真を返す。"""
         if self.deadline is not None and now >= self.deadline:
             # 手動は時間制限の対象外。ただし自律の時計を延長はしない。
             if self.mode == 1:
@@ -190,8 +221,8 @@ class RaceController:
             self.stop("終了")
             return
         if key == "e":
-            self.stop("eキーで停止", terminal=self.mode == 2 and
-                      self.started_at is not None)
+            race_in_progress = self.mode == 2 and self.started_at is not None
+            self.stop("eキーで停止", terminal=race_in_progress)
             return
         if key in ("1", "2"):
             new_mode = int(key)
@@ -229,8 +260,9 @@ class RaceController:
                 self.reason = "先にrまたはlで通行側を選択してください"
 
     def sensor_failure(self, now):
-        self.stop("画像が無効。停止して再取得",
-                  terminal=self.mode == 2 and self.stage == "GOAL_FINAL")
+        """無効な画像で前進しないよう停止し、直前の通過判定を取り消す。"""
+        in_final_advance = self.mode == 2 and self.stage == "GOAL_FINAL"
+        self.stop("画像が無効。停止して再取得", terminal=in_final_advance)
         self.previous_gray = None
         self.search_started = None
         self.recovery = None
@@ -238,21 +270,27 @@ class RaceController:
         self.near_goal_confirmations = 0
         self.visible_goal_base = None
         self.goal_base_confirmations = 0
-        # 取得異常の間を走行時間・通過実績として数えない。
-        if self.track:
-            self.track["edge_at"] = None
-            self.track["clear_elapsed"] = None
-        self.cone_side_frames = 0
-        self.cone_clear_elapsed = None
+        self._reset_pass_progress()
         self.cone_seen_at = None
         self.static_clear_since = None
         self.last_progress = now
         self.check_deadline(now)
 
+    def _reset_pass_progress(self):
+        """停止や画像の欠落があったら、障害物の通過確認を最初から行う。"""
+        if self.track:
+            self.track["edge_at"] = None
+            self.track["clear_elapsed"] = None
+        self.cone_clear_elapsed = None
+        self.cone_side_frames = 0
+
     def _motion_changed(self, scene, now):
+        """背景の明るさが変化したとき、自車が移動したとみなす。"""
         # 移動の比較は最短0.15秒ごと。直前のフレームとの差が小さすぎるのを防ぐ。
-        if (self.last_motion_sample is not None and
-                now - self.last_motion_sample < 0.15):
+        if (
+            self.last_motion_sample is not None
+            and now - self.last_motion_sample < 0.15
+        ):
             return False
         gray = scene.get("motion_gray")
         mask = scene.get("motion_mask")
@@ -272,14 +310,17 @@ class RaceController:
         return changed
 
     def _drive_toward(self, x, duty, avoid_side=None, steer_gain=None):
+        """画像上の目標に向け、左右のPWM差で車体の向きを変える。"""
         adjusted_x, adjusted_duty = self._avoid_enemy(x, duty, avoid_side)
         if (adjusted_x, adjusted_duty) != (x, duty):
             self.reason += "／相手を避けて予定側へ進行"
         x, duty = adjusted_x, adjusted_duty
         self.motion = stateMachine(self.motion, {"x": x}, None)
         error = (x - 0.5) * 2  # 中央からのずれを左端-1、右端+1に換算する。
-        turn = (STEER_GAIN if steer_gain is None else steer_gain) * error
-        base = duty * (1 - 0.35 * abs(error))  # ずれが大きいほど減速し、端では基本PWMを35%下げる。
+        gain = STEER_GAIN if steer_gain is None else steer_gain
+        turn = gain * error
+        # ずれが大きいほど減速する。目標が画像の端なら基本PWMを35%下げる。
+        base = duty * (1 - 0.35 * abs(error))
         # 通常の追従では後退させず、前進の左右差で曲がる。
         left = min(MAX_DUTY, max(0, base + turn + LEFT_TRIM))
         right = min(MAX_DUTY, max(0, base - turn + RIGHT_TRIM))
@@ -287,8 +328,9 @@ class RaceController:
 
     def _drive_around(self, obj, x, side):
         """固定障害物から離れる。近ければ旋回内側の履帯を抑えて前進量を減らす。"""
-        left, right = self._drive_toward(x, SLOW_DUTY, avoid_side=side,
-                                         steer_gain=FIXED_AVOID_STEER_GAIN)
+        left, right = self._drive_toward(
+            x, SLOW_DUTY, avoid_side=side, steer_gain=FIXED_AVOID_STEER_GAIN
+        )
         if x != 0.5 and obj["bottom"] >= FIXED_AVOID_TIGHT_BOTTOM:
             inner_limit = SLOW_DUTY * FIXED_AVOID_INNER_DUTY_SCALE
             if side == "left":
@@ -304,6 +346,7 @@ class RaceController:
         return TURN_DUTY, -TURN_DUTY
 
     def _change_stage(self, stage, now):
+        """次の区間へ進み、前の区間で追っていた円柱や復帰回数をリセットする。"""
         self.stage = stage
         self.stage_entered = now
         self.track = None
@@ -320,20 +363,28 @@ class RaceController:
         if enemy["height"] >= ENEMY_CLOSE_HEIGHT:
             # 目前では曲がり終わる前に車体正面が相手に達する可能性がある。
             left, right = min(x, 0.5), max(x, 0.5)
-        return (enemy["right"] >= left - ENEMY_STOP_HALF_WIDTH_X and
-                enemy["left"] <= right + ENEMY_STOP_HALF_WIDTH_X)
+        return (
+            enemy["right"] >= left - ENEMY_STOP_HALF_WIDTH_X
+            and enemy["left"] <= right + ENEMY_STOP_HALF_WIDTH_X
+        )
 
     def _enemy_blocks(self, scene, now):
         # 画面上部の黄色い物は避ける必要のある相手機体として数えない。
-        visible = [enemy for enemy in scene["enemies"] if enemy["bottom"] >= ENEMY_MIN_BOTTOM]
+        visible = [
+            enemy for enemy in scene["enemies"]
+            if enemy["bottom"] >= ENEMY_MIN_BOTTOM
+        ]
         if visible:
             self.last_enemy = now  # 遠方に見えた相手も、後退の判断には使う。
-        self.enemies_in_range = [enemy for enemy in visible if
-                                 (enemy["height"] >= ENEMY_MIN_HEIGHT or
-                                  enemy["area"] >= ENEMY_MIN_AREA)]
+        self.enemies_in_range = [
+            enemy for enemy in visible
+            if enemy["height"] >= ENEMY_MIN_HEIGHT or enemy["area"] >= ENEMY_MIN_AREA
+        ]
         if self.enemies_in_range:
             target = self._planned_target(scene, now)
-            blocked = any(self._enemy_overlaps(enemy, target) for enemy in self.enemies_in_range)
+            blocked = any(
+                self._enemy_overlaps(enemy, target) for enemy in self.enemies_in_range
+            )
             # 見失った場合だけ停止を保持。進路外に移ったと確認できればすぐに再開する。
             self.enemy_until = now + ENEMY_HOLD_SECONDS if blocked else -math.inf
         return now < self.enemy_until
@@ -341,8 +392,13 @@ class RaceController:
     def _static_obstacle_blocks(self, scene, now):
         # 画面下端付近にある大きな物体だけ、直前の接触リスクとして扱う。
         obstacles = scene["obstacles"] + scene["cones"]
-        if any(obj["bottom"] > 0.92 and obj["height"] > 0.2 and
-               obj["left"] < 0.58 and obj["right"] > 0.42 for obj in obstacles):
+        if any(
+            obj["bottom"] > 0.92
+            and obj["height"] > 0.2
+            and obj["left"] < 0.58
+            and obj["right"] > 0.42
+            for obj in obstacles
+        ):
             self.static_blocked = True
             self.static_clear_since = None
         elif self.static_blocked:
@@ -357,7 +413,9 @@ class RaceController:
         if not self.enemies_in_range or self.stage in ("CENTER_CLEAR", "GOAL_FINAL"):
             return x, duty
         # 停止範囲のすぐ外にいる相手のうち、予定進路に一番近いものを使う。
-        enemy = min(self.enemies_in_range, key=lambda e: max(e["left"] - x, x - e["right"]))
+        enemy = min(
+            self.enemies_in_range, key=lambda e: max(e["left"] - x, x - e["right"])
+        )
         gap = max(enemy["left"] - x, x - enemy["right"])
         if gap <= ENEMY_STOP_HALF_WIDTH_X:
             return x, duty  # 進路と重なる相手はupdateの手前で停止する。
@@ -373,8 +431,11 @@ class RaceController:
             side = self.route
         elif self.track:
             side = self.track["side"]
-        if ((side == "left" and direction > 0) or (side == "right" and direction < 0) or
-                (x - 0.5) * direction < 0):
+        if (
+            (side == "left" and direction > 0)
+            or (side == "right" and direction < 0)
+            or (x - 0.5) * direction < 0
+        ):
             return x, duty
         offset = min(ENEMY_AVOID_OFFSET_X * weight, x if direction < 0 else 1 - x)
         adjusted = x + direction * offset
@@ -384,11 +445,13 @@ class RaceController:
 
     @staticmethod
     def _nearest(objects):
-        return max(objects, key=lambda obj: obj["bottom"] + obj["height"],
-                   default=None)
+        # 画像の下にあり、大きく写る物体ほど近いとみなす。
+        return max(
+            objects, key=lambda obj: obj["bottom"] + obj["height"], default=None
+        )
 
     def _planned_target(self, scene, now):
-        """相手がいないときに、この画像で走行側が使う目標の横座標を求める。"""
+        """相手との重なりを調べるため、回避補正前の目標の横座標を求める。"""
         if self.recovery:
             return None
         if self.stage == "GOAL_FINAL":
@@ -410,7 +473,8 @@ class RaceController:
         if self.stage in ("START_EXIT", "NEAR_OBSTACLE", "FAR_OBSTACLE"):
             obj = self._tracked_obstacle(scene["obstacles"])
             if obj is not None:
-                return self._obstacle_target(obj, self._obstacle_side(obj), self._obstacle_clearance())
+                side = self._obstacle_side(obj)
+                return self._obstacle_target(obj, side, self._obstacle_clearance())
             if self.track:
                 return 0.5  # 円柱が側方に見切れた後の前進。
         flag = scene["flag"]
@@ -421,8 +485,11 @@ class RaceController:
             return self._nearest(objects)
         previous = self.track["object"]
         # 全候補を前回の円柱と照合する。別の円柱が最も大きくなっても追跡を捨てない。
-        matches = [obj for obj in objects if abs(obj["x"] - previous["x"]) <= 0.3
-                   and obj["height"] >= previous["height"] * 0.5]
+        matches = [
+            obj for obj in objects
+            if abs(obj["x"] - previous["x"]) <= 0.3
+            and obj["height"] >= previous["height"] * 0.5
+        ]
         return min(matches, key=lambda obj: abs(obj["x"] - previous["x"]), default=None)
 
     def _obstacle_side(self, obj):
@@ -434,7 +501,9 @@ class RaceController:
         return "left" if obj["x"] >= 0.5 else "right"
 
     def _obstacle_clearance(self):
-        return FAR_OBSTACLE_CLEARANCE_X if self.stage == "FAR_OBSTACLE" else OBSTACLE_CLEARANCE_X
+        if self.stage == "FAR_OBSTACLE":
+            return FAR_OBSTACLE_CLEARANCE_X
+        return OBSTACLE_CLEARANCE_X
 
     @staticmethod
     def _obstacle_target(obj, side, clearance):
@@ -448,8 +517,14 @@ class RaceController:
         """接近・側方への移動・前進の証拠をそろえて通過を推定する。"""
         obj = self._tracked_obstacle(objects)
         if self.track is None and obj is not None:
-            self.track = {"object": obj, "side": self._obstacle_side(obj), "near": False,
-                          "edge_at": None, "clear_elapsed": None, "evidence_at_loss": 0}
+            self.track = {
+                "object": obj,
+                "side": self._obstacle_side(obj),
+                "near": False,
+                "edge_at": None,
+                "clear_elapsed": None,
+                "evidence_at_loss": 0,
+            }
         track = self.track
         if track is None:
             return None
@@ -460,11 +535,10 @@ class RaceController:
             # 物体の下端が画像の縦65%より下で、高さが画像の16%を超えたら接近済みと記録。
             track["near"] |= obj["bottom"] > 0.65 and obj["height"] > 0.16
             # 左を通ると物体は右端の22%に入り、右を通ると左端の22%に入る。
-            at_edge = (obj["x"] > 0.78 if track["side"] == "left"
-                       else obj["x"] < 0.22)
+            at_side = obj["x"] > 0.78 if track["side"] == "left" else obj["x"] < 0.22
             x = self._obstacle_target(obj, track["side"], self._obstacle_clearance())
             # 横に余裕がある円柱は、画面下端から見切れることもある。
-            at_edge = x == 0.5 and (at_edge or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
+            at_edge = x == 0.5 and (at_side or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
             if x != 0.5:
                 track["edge_at"] = None  # 円柱が進路に戻ったら通過の確認をやり直す。
             if track["near"] and at_edge and track["edge_at"] is None:
@@ -476,15 +550,19 @@ class RaceController:
                 track["evidence_at_loss"] = self.forward_evidence
             elif min(self.command) > 0:
                 track["clear_elapsed"] += dt
-            if (next_stage is not None and track["clear_elapsed"] >= PASS_CLEAR_SECONDS and
-                    self.forward_evidence - track["evidence_at_loss"] >= 2):
+            if (
+                next_stage is not None
+                and track["clear_elapsed"] >= PASS_CLEAR_SECONDS
+                and self.forward_evidence - track["evidence_at_loss"] >= 2
+            ):
                 self._change_stage(next_stage, now)
                 return (0.0, 0.0)  # 段階変更時は一度止め、次の画像で進路を確認。
-        if (obj is None and track["edge_at"] is None and
-                (track["near"] or self._obstacle_target(track["object"], track["side"],
-                                                        self._obstacle_clearance()) != 0.5)):
-            self.reason = "接近対象を前方で喪失。通過と決めつけず停止"
-            return (0.0, 0.0)
+        if obj is None and track["edge_at"] is None:
+            if track["near"] or self._obstacle_target(
+                track["object"], track["side"], self._obstacle_clearance()
+            ) != 0.5:
+                self.reason = "接近対象を前方で喪失。通過と決めつけず停止"
+                return (0.0, 0.0)
         self.reason = "緑円柱を回避"
         if obj is not None:
             return self._drive_around(obj, x, track["side"])
@@ -495,12 +573,17 @@ class RaceController:
         previous = self.cone_track
         if previous is not None:
             # 隣の服や椅子の青へ、追跡対象が急に切り替わるのを防ぐ。
-            candidates = [obj for obj in candidates
-                          if abs(obj["x"] - previous["x"]) <= CONE_TRACK_MAX_JUMP_X]
+            candidates = [
+                obj for obj in candidates
+                if abs(obj["x"] - previous["x"]) <= CONE_TRACK_MAX_JUMP_X
+            ]
         if not candidates:
             return None
-        flag = scene["flag"]
-        reference = previous["x"] if previous is not None else flag["x"] if flag else 0.5
+        if previous is not None:
+            reference = previous["x"]
+        else:
+            flag = scene["flag"]
+            reference = flag["x"] if flag else 0.5
         return min(candidates, key=lambda obj: abs(obj["x"] - reference))
 
     def _cone_target(self, cone):
@@ -512,17 +595,25 @@ class RaceController:
     @staticmethod
     def _cone_ahead(scene):
         # 追跡対象から外れた青領域でも、近くの正面にある場合は見切れとは判断しない。
-        return any(obj["bottom"] >= CONE_LOSS_MIN_BOTTOM and
-                   obj["height"] >= CONE_CLEAR_MIN_HEIGHT and
-                   obj["left"] < 0.5 + CONE_SIDE_MARGIN_X and
-                   obj["right"] > 0.5 - CONE_SIDE_MARGIN_X for obj in scene["cones"])
+        return any(
+            obj["bottom"] >= CONE_LOSS_MIN_BOTTOM
+            and obj["height"] >= CONE_CLEAR_MIN_HEIGHT
+            and obj["left"] < 0.5 + CONE_SIDE_MARGIN_X
+            and obj["right"] > 0.5 - CONE_SIDE_MARGIN_X
+            for obj in scene["cones"]
+        )
 
     def _has_tracked_cone_edge(self, scene):
         cone = self.cone_track
-        if (cone is None or self.cone_seen_at is None or
-                cone["bottom"] < CONE_EDGE_TRACE_BOTTOM or self._cone_target(cone) != 0.5):
+        if (
+            cone is None
+            or self.cone_seen_at is None
+            or cone["bottom"] < CONE_EDGE_TRACE_BOTTOM
+            or self._cone_target(cone) != 0.5
+        ):
             return False
-        side = "right" if self.route == "left" else "left"  # コーンは選んだ通行側の反対に見える。
+        # コーンは選んだ通行側の反対に見える。
+        side = "right" if self.route == "left" else "left"
         if side not in scene.get("cone_edges", ()):
             return False
         if side == "left":
@@ -536,17 +627,23 @@ class RaceController:
         if self._has_tracked_cone_edge(scene):
             # 今の画像にも同じ側にコーンの断片がある。停止して待っていた場合も再開できる。
             return True
-        if (now - self.cone_seen_at > IMAGE_MAX_AGE or min(self.command) <= 0 or
-                self._cone_target(cone) != 0.5):
-            return False  # 断片すら見えない場合は、移動中の直近の観測だけを使う。
+        # 断片が見えない場合は、前進中の新しい観測だけを使う。
+        if (
+            now - self.cone_seen_at > IMAGE_MAX_AGE
+            or min(self.command) <= 0
+            or self._cone_target(cone) != 0.5
+        ):
+            return False
         if self.route == "left":
             at_side = cone["right"] >= 1 - CONE_LOSS_SIDE_EDGE_X
         else:
             at_side = cone["left"] <= CONE_LOSS_SIDE_EDGE_X
         # 下端で切れたコーンは高さが短く映るので、十分低い位置なら高さで弾かない。
-        return (cone["bottom"] >= CONE_LOSS_LOWER_EDGE or
-                (at_side and cone["bottom"] >= CONE_LOSS_MIN_BOTTOM and
-                 cone["height"] >= CONE_CLEAR_MIN_HEIGHT))
+        return cone["bottom"] >= CONE_LOSS_LOWER_EDGE or (
+            at_side
+            and cone["bottom"] >= CONE_LOSS_MIN_BOTTOM
+            and cone["height"] >= CONE_CLEAR_MIN_HEIGHT
+        )
 
     def _pass_cone(self, scene, now, dt):
         """指定側へ進入し、コーンが視野外に出た後も後部が抜けるまで直進する。"""
@@ -567,9 +664,15 @@ class RaceController:
                 self.reason = "コーンとの余裕を取り直すため指定側へ修正"
                 return self._drive_around(cone, x, self.route)
             if self.stage != "CENTER_CLEAR":
-                near = (cone["bottom"] >= CONE_CLEAR_MIN_BOTTOM and
-                        cone["height"] >= CONE_CLEAR_MIN_HEIGHT)
-                self.cone_side_frames = self.cone_side_frames + 1 if near and clear_side else 0
+                near = (
+                    cone["bottom"] >= CONE_CLEAR_MIN_BOTTOM
+                    and cone["height"] >= CONE_CLEAR_MIN_HEIGHT
+                )
+                # 近さと横の余裕を連続で確認し、1枚の誤検出で直進に切り替わるのを防ぐ。
+                if near and clear_side:
+                    self.cone_side_frames += 1
+                else:
+                    self.cone_side_frames = 0
                 if self.cone_side_frames < CONE_CLEAR_CONFIRM_FRAMES:
                     self.stage = "CENTER_PASS"
                     self.reason = "指定側でコーンに進入"
@@ -583,7 +686,7 @@ class RaceController:
                 if not self._can_follow_side_exit(scene, now):
                     self.reason = "コーンの側方を確認できず停止。再検出を待つ"
                     return 0.0, 0.0
-                # 側方が確認できたまま見切れた。3フレームに達していなくても、ここから後部の通過を確認する。
+                # 連続確認の途中で見切れても、側方に抜けた証拠があれば後部の通過確認へ進む。
                 self._change_stage("CENTER_CLEAR", now)
                 self.cone_clear_elapsed = None
             if self._cone_ahead(scene):
@@ -600,8 +703,10 @@ class RaceController:
                 self.cone_evidence_at_loss = self.forward_evidence
             elif min(self.command) > 0:
                 self.cone_clear_elapsed += dt  # 直前の指令が前進の場合だけ時間を足す。
-            if (self.cone_clear_elapsed >= CONE_CLEAR_SECONDS and
-                    self.forward_evidence - self.cone_evidence_at_loss >= 2):
+            if (
+                self.cone_clear_elapsed >= CONE_CLEAR_SECONDS
+                and self.forward_evidence - self.cone_evidence_at_loss >= 2
+            ):
                 self._change_stage("FAR_OBSTACLE", now)
                 self.cone_track = None
                 self.cone_seen_at = None
@@ -632,15 +737,18 @@ class RaceController:
         if self.recoveries > MAX_RECOVERIES:
             self.stop("自己復帰回数の上限")
             return
-        # 直進の証拠が3秒以内にあり、直近2秒に大きな旋回、直近3秒に相手の検出がなければ短く後退できる。
-        # 出発直後は自分側のポールが後ろにあるため、後退の候補から外す。
-        rear_evidence = (self.stage != "START_EXIT" and
-                         now - self.last_clear_motion < 3.0 and
-                         now - self.last_turn > 2.0 and
-                         now - self.last_enemy > 3.0)
+        # 直前に空いていた場所をまっすぐ通った証拠がある場合だけ短く後退する。
+        # 出発直後は自分側のポールが後ろにあるため、後退しない。
+        rear_evidence = (
+            self.stage != "START_EXIT"
+            and now - self.last_clear_motion < 3.0
+            and now - self.last_turn > 2.0
+            and now - self.last_enemy > 3.0
+        )
         # 物体の下端が画像の縦80%より下なら、付近に障害物があるとみなす。
-        nearby = any(obj["bottom"] > 0.8 for obj in
-                     scene["obstacles"] + scene["cones"])
+        nearby = any(
+            obj["bottom"] > 0.8 for obj in scene["obstacles"] + scene["cones"]
+        )
         if nearby and not rear_evidence:
             self.stop("周囲が狭く後方も不明。無条件の後退・旋回はしない")
             return
@@ -649,6 +757,7 @@ class RaceController:
         self.reason = "停滞を検出。一旦停止して自己復帰"
 
     def _recover(self, now):
+        """停滞時は短い停止、後退できる場合の後退、旋回の順で試す。"""
         elapsed = now - self.recovery["started"]
         if elapsed < 0.15:  # 復帰開始から0.15秒間は停止。
             return 0.0, 0.0
@@ -672,17 +781,22 @@ class RaceController:
         """赤の真下で台座候補を探し、一度選んだ後は台座の位置を基準に追う。"""
         previous = self.goal_base_track
         if previous is None:
-            if (now - self.last_goal_seen > IMAGE_MAX_AGE or
-                    (self.last_goal_area < GOAL_NEAR_AREA and self.stage != "GOAL_CREEP")):
+            red_is_old = now - self.last_goal_seen > IMAGE_MAX_AGE
+            still_approaching = (
+                self.last_goal_area < GOAL_NEAR_AREA and self.stage != "GOAL_CREEP"
+            )
+            if red_is_old or still_approaching:
                 return None
             reference_x = self.last_goal_x
         else:
             reference_x = previous["x"]
         candidates = [
             obj for obj in scene.get("goal_bases", ())
-            if abs(obj["x"] - reference_x) <= GOAL_BASE_MATCH_X and
-            (previous is None or
-             abs(obj["bottom"] - previous["bottom"]) <= GOAL_BASE_MATCH_BOTTOM)
+            if abs(obj["x"] - reference_x) <= GOAL_BASE_MATCH_X
+            and (
+                previous is None
+                or abs(obj["bottom"] - previous["bottom"]) <= GOAL_BASE_MATCH_BOTTOM
+            )
         ]
         return min(candidates, key=lambda obj: abs(obj["x"] - reference_x), default=None)
 
@@ -705,15 +819,21 @@ class RaceController:
             else:
                 self.stop("最終前進を完了。黒い台座への到達は未確認")
             return self.command
-        self.reason = ("黒い台座に正対。設定時間だけ最終前進" if self.goal_base_track is not None
-                       else "赤が視野外。設定時間だけ最終前進")
+        if self.goal_base_track is not None:
+            self.reason = "黒い台座に正対。設定時間だけ最終前進"
+        else:
+            self.reason = "赤が視野外。設定時間だけ最終前進"
         return self._drive_toward(0.5, GOAL_FINAL_DUTY)
 
     def _goal(self, flag, now):
+        """台座が見えれば台座を追い、それまでは赤い目印で進路を決める。"""
         if self.stage == "GOAL_FINAL":
             # 画面上端で赤が映ったり消えたりしても、最終前進の方位と期限を保つ。
             return self._final_goal()
-        if self.creep_started is not None and now - self.creep_started >= GOAL_CREEP_LIMIT:
+        if (
+            self.creep_started is not None
+            and now - self.creep_started >= GOAL_CREEP_LIMIT
+        ):
             self.stop("ゴールの微速進入上限。台座への到達は未確認")
             return self.command
         base = self.visible_goal_base
@@ -724,8 +844,10 @@ class RaceController:
                     self.creep_started = now
             if now - self.goal_base_seen_at > IMAGE_MAX_AGE:
                 self.goal_base_confirmations = 0
-            if (base["bottom"] >= GOAL_BASE_FINAL_BOTTOM and
-                    abs(base["x"] - 0.5) <= GOAL_BASE_FINAL_CENTER_X):
+            if (
+                base["bottom"] >= GOAL_BASE_FINAL_BOTTOM
+                and abs(base["x"] - 0.5) <= GOAL_BASE_FINAL_CENTER_X
+            ):
                 self.goal_base_confirmations += 1
             else:
                 self.goal_base_confirmations = 0
@@ -744,11 +866,13 @@ class RaceController:
                 self.reason = "黒い台座を再検出するまで停止"
             return 0.0, 0.0
         elif flag is None:
-            # 近接と整列を3回以上確認し、最後の赤が中央から7%幅未満で、観測も新しければ最終進入へ。
-            near_and_aligned = (self.near_goal_confirmations >= 3 and
-                                self.last_goal_area >= GOAL_NEAR_AREA and
-                                abs(self.last_goal_x - 0.5) < 0.07 and
-                                now - self.last_goal_seen <= IMAGE_MAX_AGE)
+            # 最後に近くの赤へ正対していた証拠がそろっていれば、時間を決めて前進する。
+            near_and_aligned = (
+                self.near_goal_confirmations >= 3
+                and self.last_goal_area >= GOAL_NEAR_AREA
+                and abs(self.last_goal_x - 0.5) < 0.07
+                and now - self.last_goal_seen <= IMAGE_MAX_AGE
+            )
             if near_and_aligned:
                 # 台座を追えない場合は従来の短い前進を使い、台座への到達は未確認として扱う。
                 return self._start_final_goal(now)
@@ -782,15 +906,80 @@ class RaceController:
             return 0.0, 0.0
         return self._drive_toward(target_x, GOAL_CREEP_DUTY)
 
+    def _start_pending_run(self, now):
+        """開始キーを受けた後、有効な画像で走行を開始・再開する。"""
+        if self.started_at is None:
+            self.started_at = self.pending_start
+            self.deadline = self.started_at + RACE_SECONDS - STOP_MARGIN
+            self.stage_entered = now
+        self.pending_start = None
+        self.phase = "RUNNING"
+        self.last_progress = now
+        self.last_motion_sample = now
+        self.track = None
+        self.recovery = None
+        self.search_started = None
+        self.cone_side_frames = 0
+        self.cone_track = None
+        self.cone_seen_at = None
+        if self.stage == "CENTER_CLEAR":
+            # 手動の間に姿勢が変わり得るので、再開時はコーンの側方を確かめ直す。
+            self.stage = "CENTER_PASS"
+            self.cone_clear_elapsed = None
+        if self.stage.startswith("GOAL_"):
+            # 手動の前に見えた目印や台座の位置を、再開後の進路に使わない。
+            self._change_stage("GOAL_ALIGN", now)
+            self.near_goal_confirmations = 0
+            self.last_goal_seen = -math.inf
+            self.last_goal_area = 0.0
+            self.last_goal_x = 0.5
+            self.creep_started = None
+            self.goal_base_track = None
+            self.goal_base_seen_at = -math.inf
+            self.goal_base_confirmations = 0
+
+    def _course_command(self, scene, flag, now, dt):
+        """コースの進行段階に対応する走行指令を選ぶ。"""
+        if self.stage == "START_EXIT":
+            # 発進から0.4秒以上経ち、前進の証拠が2回以上あれば次の段階へ進む。
+            if self.forward_evidence >= 2 and now - self.stage_entered >= 0.4:
+                track = self.track
+                self._change_stage("NEAR_OBSTACLE", now)
+                self.track = track  # 発進時に選んだ円柱と回避側をそのまま引き継ぐ。
+        if self.stage == "START_EXIT":
+            command = self._pass_object(scene["obstacles"], None, now, dt)
+        elif self.stage in ("NEAR_OBSTACLE", "FAR_OBSTACLE"):
+            next_stage = (
+                "CENTER_APPROACH" if self.stage == "NEAR_OBSTACLE" else "GOAL_ALIGN"
+            )
+            command = self._pass_object(scene["obstacles"], next_stage, now, dt)
+        elif self.stage in ("CENTER_APPROACH", "CENTER_PASS", "CENTER_CLEAR"):
+            command = self._pass_cone(scene, now, dt)
+        elif self.stage.startswith("GOAL_"):
+            command = self._goal(flag, now)
+        else:
+            command = None
+        if command is not None:
+            return command
+        # まだ追跡対象が決まらない区間では、赤い目印に向かうか旋回して探す。
+        if flag:
+            return self._drive_toward(flag["x"], DRIVE_DUTY)
+        return self._search(now)
+
     def update(self, scene, now):
-        """有効画像1枚につき1回呼び、(左PWM, 右PWM)を返す。"""
+        """観測を受け取り、期限・画像・進路を確認して(左PWM, 右PWM)を返す。"""
         dt = 0 if self.last_update_at is None else now - self.last_update_at
         self.last_update_at = now
         if self.check_deadline(now) or self.quit:
             return self.command
-        if scene is None or not scene.get("valid", False) or now - scene.get("received_at", now) > IMAGE_MAX_AGE:
+        if (
+            scene is None
+            or not scene.get("valid", False)
+            or now - scene.get("received_at", now) > IMAGE_MAX_AGE
+        ):
             self.sensor_failure(now)
             return self.command
+
         moving = self._motion_changed(scene, now)
         if self.mode == 1:
             self.command = self.manual_command
@@ -805,49 +994,25 @@ class RaceController:
             if min(self.command) > 0:
                 self.final_driven_seconds += max(0.0, dt)
         if self.pending_start is not None:
-            if self.started_at is None:
-                self.started_at = self.pending_start
-                self.deadline = self.started_at + RACE_SECONDS - STOP_MARGIN
-                self.stage_entered = now
-            self.pending_start = None
-            self.phase = "RUNNING"
-            self.last_progress = now
-            self.last_motion_sample = now
-            self.track = None
-            self.recovery = None
-            self.search_started = None
-            self.cone_side_frames = 0
-            self.cone_track = None
-            self.cone_seen_at = None
-            if self.stage == "CENTER_CLEAR":
-                # 手動の間に姿勢が変わり得るので、再開時はコーンの側方を確かめ直す。
-                self.stage = "CENTER_PASS"
-                self.cone_clear_elapsed = None
-            if self.stage.startswith("GOAL_"):
-                # 手動の前に見えた目印や台座の位置を、再開後の進路に使わない。
-                self._change_stage("GOAL_ALIGN", now)
-                self.near_goal_confirmations = 0
-                self.last_goal_seen = -math.inf
-                self.last_goal_area = 0.0
-                self.last_goal_x = 0.5
-                self.creep_started = None
-                self.goal_base_track = None
-                self.goal_base_seen_at = -math.inf
-                self.goal_base_confirmations = 0
+            self._start_pending_run(now)
             if self.check_deadline(now):
                 return self.command
         if self.phase != "RUNNING":
             self.command = (0.0, 0.0)
             return self.command
+
+        # 前の指令と今回の画像を使い、実際に移動した証拠を集める。
+        duty_difference = abs(self.command[0] - self.command[1])
         if moving and min(self.command) > 0:
             self.forward_evidence += 1
             self.last_progress = now
             # 左右のPWM差が10ポイント未満で、相手・円柱・コーンが見えなければ直進を記録する。
-            if abs(self.command[0] - self.command[1]) < 10:
+            if duty_difference < 10:
                 if not scene["enemies"] and not scene["obstacles"] and not scene["cones"]:
                     self.last_clear_motion = now
-        if abs(self.command[0] - self.command[1]) > 15:  # 15ポイントを超える差は大きな旋回の指令とみなす。
+        if duty_difference > 15:  # 15ポイントを超えるPWM差は大きな旋回とみなす。
             self.last_turn = now
+
         flag = scene["flag"]
         if flag:
             self.last_goal_x = flag["x"]
@@ -856,6 +1021,8 @@ class RaceController:
         self.visible_goal_base = None
         if self.stage in ("GOAL_ALIGN", "GOAL_APPROACH", "GOAL_CREEP", "GOAL_BASE"):
             self.visible_goal_base = self._select_goal_base(scene, now)
+
+        # 進路が塞がっていれば、通常の操舵や停滞からの復帰より先に止める。
         if self._enemy_blocks(scene, now):
             if self.stage == "GOAL_FINAL":
                 self.stop("最終進入中に相手を検出。到達未確認で停止")
@@ -865,12 +1032,7 @@ class RaceController:
             self.last_progress = now  # 意図した待機をスタックと判定しない。
             self.near_goal_confirmations = 0
             self.goal_base_confirmations = 0
-            # 相手による遮蔽中に通過時間だけを消費しない。
-            if self.track:
-                self.track["edge_at"] = None
-                self.track["clear_elapsed"] = None
-            self.cone_clear_elapsed = None
-            self.cone_side_frames = 0
+            self._reset_pass_progress()
             self.static_clear_since = None
             return self.command
         if self._static_obstacle_blocks(scene, now):
@@ -882,18 +1044,18 @@ class RaceController:
             self.last_progress = now  # 意図的に止めている間は復帰のタイマーを進めない。
             self.recovery = None
             self.goal_base_confirmations = 0
-            if self.track:
-                self.track["edge_at"] = None
-                self.track["clear_elapsed"] = None
-            self.cone_clear_elapsed = None
-            self.cone_side_frames = 0
+            self._reset_pass_progress()
             return self.command
+
         if self.recovery:
             self.command = self._recover(now)
             return self.command
-        if (self.stage not in ("GOAL_CREEP", "GOAL_BASE", "GOAL_FINAL") and
-                self.search_started is None and min(self.command) > 0 and
-                now - self.last_progress >= STALL_SECONDS):
+        if (
+            self.stage not in ("GOAL_CREEP", "GOAL_BASE", "GOAL_FINAL")
+            and self.search_started is None
+            and min(self.command) > 0
+            and now - self.last_progress >= STALL_SECONDS
+        ):
             if self.enemies_in_range:
                 self.command = (0.0, 0.0)
                 self.reason = "相手が近いため復帰旋回を待機"
@@ -902,28 +1064,7 @@ class RaceController:
             else:
                 self._begin_recovery(scene, now)
             return self.command
-        self.search_started = None if flag else self.search_started
-        if self.stage == "START_EXIT":
-            # 発進から0.4秒以上経ち、前進の証拠が2回以上あれば次の段階へ進む。
-            if self.forward_evidence >= 2 and now - self.stage_entered >= 0.4:
-                track = self.track
-                self._change_stage("NEAR_OBSTACLE", now)
-                self.track = track  # 発進時に選んだ円柱と回避側をそのまま引き継ぐ。
-        if self.stage == "START_EXIT":
-            command = self._pass_object(scene["obstacles"], None, now, dt)
-        elif self.stage in ("NEAR_OBSTACLE", "FAR_OBSTACLE"):
-            next_stage = "CENTER_APPROACH" if self.stage == "NEAR_OBSTACLE" else "GOAL_ALIGN"
-            command = self._pass_object(scene["obstacles"], next_stage, now, dt)
-        elif self.stage in ("CENTER_APPROACH", "CENTER_PASS", "CENTER_CLEAR"):
-            command = self._pass_cone(scene, now, dt)
-        elif self.stage.startswith("GOAL_"):
-            command = self._goal(flag, now)
-        else:
-            command = None
-        if command is None:
-            if flag:
-                command = self._drive_toward(flag["x"], DRIVE_DUTY)
-            else:
-                command = self._search(now)
-        self.command = command
+        if flag:
+            self.search_started = None
+        self.command = self._course_command(scene, flag, now, dt)
         return self.command

@@ -1,64 +1,71 @@
+"""左右のモータを GPIO と PWM で動かす。"""
+
 import lgpio
 
 
 class ClsDualMotorControl:
-	def __init__(self, vPortsDrive, vPortsPWM, sFrequency):
-		self.__hGPIO = lgpio.gpiochip_open(0)
-		self.__vPortsDrive = vPortsDrive
-		self.resetPort()
+    """方向ピンとPWMピンを操作する2モータ用ドライバ。"""
 
-		self.__vPortsPWM = vPortsPWM
-		self.__sFrequency = sFrequency
-		self.setPWM(0, 0)
+    def __init__(self, vPortsDrive, vPortsPWM, sFrequency):
+        """方向ピンは [AIN1, AIN2, BIN1, BIN2, STBY] の順で渡す。"""
+        self.__hGPIO = lgpio.gpiochip_open(0)
+        self.__vPortsDrive = vPortsDrive
+        self.resetPort()
 
-	def __del__(self):
-		self.resetPort()
-		self.setPWM(0, 0)
-		self.setPWM(0, 1)
-		lgpio.gpiochip_close(self.__hGPIO)
+        self.__vPortsPWM = vPortsPWM  # [モータ0のPWMピン, モータ1のPWMピン]
+        self.__sFrequency = sFrequency  # PWMの周波数（Hz）。
+        self.setPWM(0, 0)
 
-	def resetPort(self):
-		for sPortNum in range(5):
-			lgpio.gpio_write(self.__hGPIO, self.__vPortsDrive[sPortNum], 0)
+    def __del__(self):
+        # GPIOを閉じる前に、方向信号と両モータのPWMを落とす。
+        self.stop()
+        lgpio.gpiochip_close(self.__hGPIO)
 
-	def setPWM(self, sDuty, sMotorNumber):
-		lgpio.tx_pwm(self.__hGPIO, self.__vPortsPWM[sMotorNumber], self.__sFrequency, sDuty)
+    def resetPort(self):
+        """4本の方向ピンとSTBYを0にし、ドライバを待機状態にする。"""
+        for pin_index in range(5):
+            pin = self.__vPortsDrive[pin_index]
+            lgpio.gpio_write(self.__hGPIO, pin, 0)
 
-	def stop(self):
-		self.resetPort()
-		self.setPWM(0,0)
-		self.setPWM(0,1)
+    def setPWM(self, sDuty, sMotorNumber):
+        """指定したモータの出力をデューティ比（0～100%）で設定する。"""
+        pin = self.__vPortsPWM[sMotorNumber]
+        lgpio.tx_pwm(self.__hGPIO, pin, self.__sFrequency, sDuty)
 
-	def driveMotor(self, sMotorNumber, sDirection, sDuty):
-		sPort = sMotorNumber * 2 + sDirection
-		lgpio.gpio_write(self.__hGPIO, self.__vPortsDrive[4], 1) 		# negate STBY port
-		lgpio.gpio_write(self.__hGPIO, self.__vPortsDrive[sPort], 1)	# assert direction port
-		self.setPWM(sDuty, sMotorNumber)
+    def stop(self):
+        """ドライバを待機状態にし、左右の出力を0%にする。"""
+        self.resetPort()
+        self.setPWM(0, 0)
+        self.setPWM(0, 1)
+
+    def driveMotor(self, sMotorNumber, sDirection, sDuty):
+        """モータ番号と方向（どちらも0または1）を選んで駆動する。"""
+        # モータ0はAIN1/AIN2、モータ1はBIN1/BIN2を使う。
+        direction_index = sMotorNumber * 2 + sDirection
+        standby_pin = self.__vPortsDrive[4]
+        direction_pin = self.__vPortsDrive[direction_index]
+
+        # STBYを1にすると出力できる。呼び出し側は反転前にstop()を呼ぶ。
+        lgpio.gpio_write(self.__hGPIO, standby_pin, 1)
+        lgpio.gpio_write(self.__hGPIO, direction_pin, 1)
+        self.setPWM(sDuty, sMotorNumber)
 
 
 if __name__ == "__main__":
-	import time
+    import time
 
-	vPortsDrive = [23, 22, 25, 9, 10]  #AIN1, AIN2, BIN1, BIN2, STBY
-	vPortsPWM = [12, 13]
-	sFrequency = 10000
+    # このファイルを直接実行したときのモータ試験。
+    drive_pins = [23, 22, 25, 9, 10]
+    pwm_pins = [12, 13]
+    frequency_hz = 10000
 
-	ClsDmc = ClsDualMotorControl(vPortsDrive, vPortsPWM, sFrequency)
-	ClsDmc.stop()
+    driver = ClsDualMotorControl(drive_pins, pwm_pins, frequency_hz)
+    driver.stop()
 
-	try:
-		while True:
-			ClsDmc.driveMotor(0, 0, 80)
-			time.sleep(2)
-
-			ClsDmc.driveMotor(0, 1, 80)
-			time.sleep(2)
-
-			ClsDmc.driveMotor(1, 0, 80)
-			time.sleep(2)
-
-			ClsDmc.driveMotor(1, 1, 80)
-			time.sleep(2)
-
-	except KeyboardInterrupt:
-		del ClsDmc
+    try:
+        while True:
+            for motor_number, direction in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                driver.driveMotor(motor_number, direction, 80)
+                time.sleep(2)
+    except KeyboardInterrupt:
+        del driver
