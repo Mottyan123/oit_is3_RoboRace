@@ -27,6 +27,11 @@ HSV_RANGES = {
 
 MIN_AREA_RATIO = 0.0003  # 小さい色ノイズを除く。画像面積に対する割合。
 
+# 近い相手の黄色は斜めを向いたり、画面端で切れたりして横長に見えなくなる。
+ENEMY_NEAR_MIN_HEIGHT = 0.20  # 形の条件を緩める黄色の最小高さ。画像高に対する割合。
+ENEMY_NEAR_MIN_WIDTH = 0.075  # 接近時も細い黄色の線を除くために必要な幅。画像幅に対する割合。
+ENEMY_NEAR_MIN_BOTTOM = 0.68  # 画面下側にある黄色を接近候補にする下端位置。
+
 # 画面端でコーンの一部だけが見えるときは、細い断片も拾う。
 CONE_EDGE_HSV = ((104, 130, 40), (122, 255, 255))  # 端に残る青のHSV範囲。
 CONE_EDGE_BAND_X = 0.12  # 左右の端から画像幅の12%だけを調べる。
@@ -94,8 +99,18 @@ def _find_objects(mask, kind):
                 and 4 <= len(polygon) <= 8
             ):
                 continue
-        elif kind == "enemy" and (aspect < 1.5 or fill < 0.5):
-            continue  # 相手の目印は黄色い横長方形。
+        elif kind == "enemy":
+            horizontal = aspect >= 1.5 and fill >= 0.5
+            # 上端に触れる大きな黄色は、レンズの前を覆っている場合がある。
+            covers_top = y == 0 and w >= width * 0.30
+            near = (
+                h >= height * ENEMY_NEAR_MIN_HEIGHT
+                and w >= width * ENEMY_NEAR_MIN_WIDTH
+                and fill >= 0.65
+                and (bottom >= height * ENEMY_NEAR_MIN_BOTTOM or covers_top)
+            )
+            if not (horizontal or near):
+                continue
         elif kind == "obstacle" and aspect > 0.8 and bottom < height * 0.9:
             continue  # 横長の緑ノイズを除く。接近して画面下端に切れる場合は残す。
         elif kind == "cone" and aspect > 2.0:

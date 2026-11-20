@@ -14,14 +14,13 @@ STOP_MARGIN = 0.2  # 監視周期や車体が止まるまでの遅れを見込�
 
 # PWMのデューティ比は、モータに電圧をかける時間の割合（0～100%）。
 # 同じ指令でも実際の速度は機体によって異なる。
-DRIVE_DUTY = 100.0  # 自律走行で通常前進するときの基本PWM（%）。
-SLOW_DUTY = 100.0  # 障害物回避・ゴール接近・復帰時の短い後退に使うPWM（%）。
+DRIVE_DUTY = 100.0  # 自律での前進・回避・向き合わせ・復帰時の後退に使う基本PWM（%）。
 TURN_DUTY = 100.0  # 左右のモータを逆向きに回す旋回のPWM（%）。手動と自律で共通。
 MANUAL_DUTY = 100.0  # 手動で前進・後退するときのPWM（%）。
 STEER_GAIN = 10.0  # 通常の操舵の強さ。値を上げると左右のPWM差が大きくなる。
 FIXED_AVOID_STEER_GAIN = 35.0  # 円柱・コーンへ寄る前に方向を変えるための操舵ゲイン（PWMのポイント数）。
 FIXED_AVOID_TIGHT_BOTTOM = 0.78  # 物体の下端が画像高の78%以上で、まだ操舵が必要なら小回りへ切り替える。
-FIXED_AVOID_INNER_DUTY_SCALE = 0.35  # 接近時に曲がる内側の履帯のPWM上限。SLOW_DUTYに対する倍率。
+FIXED_AVOID_INNER_DUTY_SCALE = 0.35  # 接近時に曲がる内側の履帯のPWM上限。DRIVE_DUTYに対する倍率。
 MAX_DUTY = 100.0  # 左右それぞれの出力上限（%）。手動時の出力にも適用される。
 LEFT_TRIM = 0.0  # 自律で目標を追うときの左モータ補正。正なら左PWMを増やす（ポイント）。
 RIGHT_TRIM = 0.0  # 自律で目標を追うときの右モータ補正。正なら右PWMを増やす（ポイント）。
@@ -31,6 +30,8 @@ IMAGE_MAX_AGE = 0.5  # 画像取得から判断までの許容時間（秒）。
 
 # 進路上の相手には停止し、進路のすぐ外にいる相手には減速と操舵で対応する。
 ENEMY_HOLD_SECONDS = 1.0  # 進路を塞いでいた相手を見失った場合に停止を保持する時間（秒）。
+ENEMY_CLOSE_HOLD_SECONDS = 2.5  # 至近距離で進路を塞いでいた相手は、目印が見切れても長めに待つ（秒）。
+ENEMY_CLEAR_SECONDS = 0.25  # 停止中、見えている相手が進路外に連続していることを確認する時間（秒）。
 ENEMY_STOP_HALF_WIDTH_X = 0.12  # 予定進路の左右に取る停止判定の幅。車体の分も見込み、画像幅の12%ずつ。
 ENEMY_AVOID_RANGE_X = 0.15  # 停止範囲の外側で低速回避を始める追加幅。画像幅に対する割合。
 ENEMY_AVOID_OFFSET_X = 0.08  # 回避で予定目標をずらす最大量。大きくすると画像上の舵の補正が強くなる。
@@ -63,11 +64,13 @@ CONE_LOSS_MIN_BOTTOM = 0.78  # 横端のコーンを近いとみなす下端の�
 CONE_LOSS_LOWER_EDGE = 0.90  # 横に十分離れたコーンが画像下端から見切れるとみなす位置。画像高の90%以上。
 CONE_EDGE_TRACE_SIDE_X = 0.25  # 端の青を追跡中のコーンと結びつけるには、直前のコーンの外縁も同じ側の25%以内。
 CONE_EDGE_TRACE_BOTTOM = 0.65  # 端の断片に移る前に、追跡中のコーンが画像高の65%以上まで近づいていること。
-CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する最低時間（秒）。SLOW_DUTYで試走して調整する。
+CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する最低時間（秒）。DRIVE_DUTYで試走して調整する。
 
 # ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
-GOAL_NEAR_AREA = 0.025  # 面積比2.5%。減速と、赤を見失う直前に十分近かったかの判定に使う。
-GOAL_CREEP_AREA = 0.065  # 面積比6.5%。赤が中央付近にあれば微速進入に切り替える。
+GOAL_NEAR_AREA = 0.025  # 面積比2.5%。赤い目印が十分近くにあるかを判定する。
+GOAL_CREEP_AREA = 0.065  # 面積比6.5%。赤が中央付近にあればGOAL_CREEPへ切り替える。
+
+GOAL_CREEP_LIMIT = 24.0  # GOAL_CREEPまたはGOAL_BASEに入ってからの上限（秒）。再検出待ちの時間も含む。
 
 # 赤い目印の下に台座を見つけたら、その位置を追う。近づいて正面を向くと最終前進へ移る。
 GOAL_BASE_MATCH_X = 0.10  # 赤い目印の真下、または前の台座位置から許す横ずれ。画像幅の10%。
@@ -81,12 +84,6 @@ GOAL_BASE_LOSS_SECONDS = 0.6  # 台座を途中で見失った場合、その場
 GOAL_FINAL_ADVANCE_SECONDS = 3.0  # 最終前進時間（秒）。台座の手前で止まる場合は延ばす。Noneなら停止。
 GOAL_FINAL_DUTY = 100.0  # 最後に直進するときの基本PWM（%）。前進時間はこのPWMで実測して調整する。
 GOAL_FINAL_MAX_SECONDS = 5.0  # 視野外での前進時間に設定できる上限（秒）。
-
-# 微速進入では短い前進と停止を繰り返す。
-GOAL_CREEP_DUTY = 90.0  # 微速進入で前進するときの基本PWM（%）。
-GOAL_CREEP_LIMIT = 24.0  # 赤や台座を追う微速区間の上限（秒）。観測で停止している時間も含む。
-GOAL_CREEP_PERIOD_SECONDS = 0.35  # 前進と停止を合わせた1周期の長さ（秒）。
-GOAL_CREEP_MOVE_SECONDS = 0.30  # 各周期の前進時間（秒）。伸ばすとよく進む。停止時間を残すため周期未満にする。
 
 
 def _target_x(info):
@@ -161,6 +158,7 @@ class RaceController:
         # 相手や障害物によって一時停止したときの記録。
         self.last_enemy = -math.inf
         self.enemy_until = -math.inf
+        self.enemy_clear_since = None
         self.static_blocked = False
         self.static_clear_since = None
         self.enemies_in_range = []  # 現在の画像で停止・回避の判断に使える黄色い目印。
@@ -273,6 +271,7 @@ class RaceController:
         self._reset_pass_progress()
         self.cone_seen_at = None
         self.static_clear_since = None
+        self.enemy_clear_since = None
         self.last_progress = now
         self.check_deadline(now)
 
@@ -312,15 +311,22 @@ class RaceController:
     def _drive_toward(self, x, duty, avoid_side=None, steer_gain=None):
         """画像上の目標に向け、左右のPWM差で車体の向きを変える。"""
         adjusted_x, adjusted_duty = self._avoid_enemy(x, duty, avoid_side)
-        if (adjusted_x, adjusted_duty) != (x, duty):
-            self.reason += "／相手を避けて予定側へ進行"
+        if adjusted_x != x:
+            self.reason += "／相手から離れる方向へ操舵"
+        elif adjusted_duty != duty:
+            self.reason += "／相手の側方を減速して通過"
         x, duty = adjusted_x, adjusted_duty
         self.motion = stateMachine(self.motion, {"x": x}, None)
         error = (x - 0.5) * 2  # 中央からのずれを左端-1、右端+1に換算する。
         gain = STEER_GAIN if steer_gain is None else steer_gain
         turn = gain * error
-        # ずれが大きいほど減速する。目標が画像の端なら基本PWMを35%下げる。
-        base = duty * (1 - 0.35 * abs(error))
+        if self.stage in ("GOAL_APPROACH", "GOAL_CREEP", "GOAL_BASE"):
+            # 外側のPWMを保ち、曲がる内側だけを抑えて左右差をつける。
+            # 相手を避けるための減速があるときは、補正後のdutyを使う。
+            base = duty - abs(turn)
+        else:
+            # 目標のずれに応じて両側を減速する。画像の端では基本PWMを35%下げる。
+            base = duty * (1 - 0.35 * abs(error))
         # 通常の追従では後退させず、前進の左右差で曲がる。
         left = min(MAX_DUTY, max(0, base + turn + LEFT_TRIM))
         right = min(MAX_DUTY, max(0, base - turn + RIGHT_TRIM))
@@ -329,10 +335,10 @@ class RaceController:
     def _drive_around(self, obj, x, side):
         """固定障害物から離れる。近ければ旋回内側の履帯を抑えて前進量を減らす。"""
         left, right = self._drive_toward(
-            x, SLOW_DUTY, avoid_side=side, steer_gain=FIXED_AVOID_STEER_GAIN
+            x, DRIVE_DUTY, avoid_side=side, steer_gain=FIXED_AVOID_STEER_GAIN
         )
         if x != 0.5 and obj["bottom"] >= FIXED_AVOID_TIGHT_BOTTOM:
-            inner_limit = SLOW_DUTY * FIXED_AVOID_INNER_DUTY_SCALE
+            inner_limit = DRIVE_DUTY * FIXED_AVOID_INNER_DUTY_SCALE
             if side == "left":
                 left = min(left, inner_limit)
             else:
@@ -374,20 +380,42 @@ class RaceController:
             enemy for enemy in scene["enemies"]
             if enemy["bottom"] >= ENEMY_MIN_BOTTOM
         ]
+        previous_enemy_seen = self.last_enemy
         if visible:
             self.last_enemy = now  # 遠方に見えた相手も、後退の判断には使う。
         self.enemies_in_range = [
             enemy for enemy in visible
             if enemy["height"] >= ENEMY_MIN_HEIGHT or enemy["area"] >= ENEMY_MIN_AREA
         ]
-        if self.enemies_in_range:
-            target = self._planned_target(scene, now)
-            blocked = any(
-                self._enemy_overlaps(enemy, target) for enemy in self.enemies_in_range
-            )
-            # 見失った場合だけ停止を保持。進路外に移ったと確認できればすぐに再開する。
-            self.enemy_until = now + ENEMY_HOLD_SECONDS if blocked else -math.inf
-        return now < self.enemy_until
+        if not self.enemies_in_range:
+            # 見失ったら、最後に進路を塞いでいた時点から一定時間待つ。
+            self.enemy_clear_since = None
+            if now >= self.enemy_until:
+                self.enemy_until = -math.inf
+            return now < self.enemy_until
+
+        target = self._planned_target(scene, now)
+        blockers = [
+            enemy for enemy in self.enemies_in_range if self._enemy_overlaps(enemy, target)
+        ]
+        if blockers:
+            # 進路に入ったフレームで停止する。進路外の確認はここからやり直す。
+            close = any(enemy["height"] >= ENEMY_CLOSE_HEIGHT for enemy in blockers)
+            hold = ENEMY_CLOSE_HOLD_SECONDS if close else ENEMY_HOLD_SECONDS
+            self.enemy_until = max(self.enemy_until, now + hold)
+            self.enemy_clear_since = None
+            return True
+        if self.enemy_until == -math.inf:
+            return False
+
+        # 境界で検出枠が揺れても、進路外の確認が続くまで停止を保つ。
+        if self.enemy_clear_since is None or now - previous_enemy_seen > IMAGE_MAX_AGE:
+            self.enemy_clear_since = now
+        if now - self.enemy_clear_since < ENEMY_CLEAR_SECONDS:
+            return True
+        self.enemy_until = -math.inf
+        self.enemy_clear_since = None
+        return False
 
     def _static_obstacle_blocks(self, scene, now):
         # 画面下端付近にある大きな物体だけ、直前の接触リスクとして扱う。
@@ -425,7 +453,8 @@ class RaceController:
         weight = 1 - distance / ENEMY_AVOID_RANGE_X
         duty *= 1 - (1 - ENEMY_AVOID_DUTY_SCALE) * weight
         direction = 1 if enemy["right"] < x else -1
-        # 回避のための追加の舵は、コーンや円柱で既に選んだ側と同じ場合だけ加える。
+        # コーンや円柱で通行側が決まっている間は、その側を守る。
+        # 側の指定がない区間では、相手との間隔を広げるため画像中央へ舵を戻すこともできる。
         side = avoid_side
         if self.stage in ("CENTER_APPROACH", "CENTER_PASS"):
             side = self.route
@@ -434,7 +463,6 @@ class RaceController:
         if (
             (side == "left" and direction > 0)
             or (side == "right" and direction < 0)
-            or (x - 0.5) * direction < 0
         ):
             return x, duty
         offset = min(ENEMY_AVOID_OFFSET_X * weight, x if direction < 0 else 1 - x)
@@ -566,7 +594,7 @@ class RaceController:
         self.reason = "緑円柱を回避"
         if obj is not None:
             return self._drive_around(obj, x, track["side"])
-        return self._drive_toward(x, SLOW_DUTY)
+        return self._drive_toward(x, DRIVE_DUTY)
 
     def _select_cone(self, scene):
         candidates = scene["cones"]
@@ -696,7 +724,7 @@ class RaceController:
             if self._has_tracked_cone_edge(scene):
                 self.cone_clear_elapsed = None
                 self.reason = "側端にコーンの断片を確認。方位を保って直進"
-                return self._drive_toward(0.5, SLOW_DUTY)
+                return self._drive_toward(0.5, DRIVE_DUTY)
             if self.cone_clear_elapsed is None or dt > IMAGE_MAX_AGE:
                 # 消失を最初に観測した時点を起点にする。それ以前の時間は含めない。
                 self.cone_clear_elapsed = 0.0
@@ -716,7 +744,7 @@ class RaceController:
             self.reason = "コーンの横を直進。車体後部が抜けるまで進路を維持"
         else:
             self.reason = "コーンが視野外。後部が抜けるまで直進"
-        return self._drive_toward(0.5, SLOW_DUTY)
+        return self._drive_toward(0.5, DRIVE_DUTY)
 
     def _search(self, now):
         if self.search_started is None:
@@ -762,7 +790,7 @@ class RaceController:
         if elapsed < 0.15:  # 復帰開始から0.15秒間は停止。
             return 0.0, 0.0
         if self.recovery["reverse"] and elapsed < 0.33:  # 後退できる場合は開始0.33秒まで後退。
-            return -SLOW_DUTY, -SLOW_DUTY
+            return -DRIVE_DUTY, -DRIVE_DUTY
         if elapsed < 0.75:  # 開始0.75秒まで旋回。失敗が続いたら試行ごとに向きを変える。
             side = self.route
             if self.recoveries % 2 == 0:
@@ -834,7 +862,7 @@ class RaceController:
             self.creep_started is not None
             and now - self.creep_started >= GOAL_CREEP_LIMIT
         ):
-            self.stop("ゴールの微速進入上限。台座への到達は未確認")
+            self.stop("ゴール進入の時間上限。台座への到達は未確認")
             return self.command
         base = self.visible_goal_base
         if base is not None:
@@ -856,7 +884,7 @@ class RaceController:
             if self.goal_base_confirmations >= GOAL_BASE_CONFIRM_FRAMES:
                 return self._start_final_goal(now)
             target_x = base["x"]
-            self.reason = "黒い台座の中央へ微速進入"
+            self.reason = "黒い台座の中央へ前進"
         elif self.stage == "GOAL_BASE":
             self.goal_base_confirmations = 0
             # 台座の位置を確認してから進む。再検出できるまでは車体を動かさない。
@@ -891,20 +919,14 @@ class RaceController:
             if self.stage == "GOAL_ALIGN":
                 if error < 0.05:  # 最初の整列は中央から5%幅未満で完了。
                     self._change_stage("GOAL_APPROACH", now)
-                return self._drive_toward(target_x, SLOW_DUTY)
+                    return self._drive_toward(target_x, MAX_DUTY)
+                return self._drive_toward(target_x, DRIVE_DUTY)
             if self.stage == "GOAL_APPROACH":
                 if flag["area"] >= GOAL_CREEP_AREA and error < 0.07:
                     self._change_stage("GOAL_CREEP", now)
                     self.creep_started = now
-                else:
-                    duty = SLOW_DUTY if flag["area"] >= GOAL_NEAR_AREA else DRIVE_DUTY
-                    return self._drive_toward(target_x, duty)
-            self.reason = "ゴール微速進入（到達は画像による推定）"
-        elapsed = now - self.creep_started
-        # 各周期の先頭で前進し、残りの時間は停止して観測する。
-        if elapsed % GOAL_CREEP_PERIOD_SECONDS >= GOAL_CREEP_MOVE_SECONDS:
-            return 0.0, 0.0
-        return self._drive_toward(target_x, GOAL_CREEP_DUTY)
+            self.reason = "赤いひし形へ前進"
+        return self._drive_toward(target_x, MAX_DUTY)
 
     def _start_pending_run(self, now):
         """開始キーを受けた後、有効な画像で走行を開始・再開する。"""
