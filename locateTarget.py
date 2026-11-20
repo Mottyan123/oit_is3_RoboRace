@@ -2,12 +2,19 @@
 import cv2
 import numpy as np
 
-# OpenCVのH（色相）は0～179。照明で変わるので、実機画像で調整する。
+# OpenCVのH（色相）は0～179。H/S/Vの順に下限と上限を指定する。
+# contextの5地点の実機画像に合わせ、赤・緑・青を調整した。
 HSV_RANGES = {
-    "flag": [((0, 100, 50), (10, 255, 255)),
-             ((165, 100, 50), (179, 255, 255))],
-    "obstacle": [((35, 80, 45), (85, 255, 255))],
-    "cone": [((90, 90, 45), (135, 255, 255))],
+    # 赤いひし形は彩度が高い。色相の両端を拾いつつ、床の反射などを除く。
+    "flag": [((0, 175, 75), (10, 255, 255)),
+             ((168, 175, 75), (179, 255, 255))],
+    # 円柱の影は暗いので明度の下限は低くする。純緑寄りの帯は鮮やかな画素に絞る。
+    "obstacle": [((43, 105, 48), (59, 255, 255)),
+                 ((60, 225, 48), (67, 255, 255))],
+    # コーンの色相は主に111～114。紫寄りの青は彩度が高い場合だけ残す。
+    "cone": [((104, 150, 50), (116, 255, 255)),
+             ((117, 220, 50), (122, 255, 255))],
+    # 提供画像には黄色い相手機体が写っていないため、従来の範囲を使う。
     "enemy": [((18, 100, 60), (34, 255, 255))],
 }
 MIN_AREA_RATIO = 0.0003  # 小さい色ノイズを除く。画像面積に対する割合。
@@ -26,7 +33,13 @@ def _color_mask(imInputHSV, kind):
         mask = cv2.bitwise_or(mask, part)
     kernel = np.ones((3, 3), dtype=np.uint8)
     # openingで点ノイズを除き、closingで領域内の小さな穴を埋める。
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    opening_kernel = kernel
+    if kind == "obstacle":
+        # 緑の円柱は縦長。横方向に数画素しかない遠方の円柱を残し、
+        # 横に伸びた緑ノイズは除く。高さ240画素では縦7画素を使う。
+        vertical_pixels = max(5, round(mask.shape[0] * 7 / 240))
+        opening_kernel = np.ones((vertical_pixels, 1), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, opening_kernel)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
@@ -51,6 +64,8 @@ def _find_objects(mask, kind):
                 continue
         elif kind == "enemy" and (aspect < 1.5 or fill < 0.5):
             continue  # 相手の目印は黄色い横長方形。
+        elif kind == "obstacle" and aspect > 0.8 and y + h < height * 0.9:
+            continue  # 横長の緑ノイズを除く。接近して画面下端に切れる場合は残す。
         elif kind == "cone" and aspect > 2.0:
             continue
         # 制御用は0～1に正規化。解像度を変えても中心は常に0.5になる。
