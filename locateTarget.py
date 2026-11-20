@@ -18,6 +18,12 @@ HSV_RANGES = {
     "enemy": [((18, 100, 60), (34, 255, 255))],
 }
 MIN_AREA_RATIO = 0.0003  # 小さい色ノイズを除く。画像面積に対する割合。
+# 停止画像の青い先端は、通常の面積閾値や平滑化で消える。見切れ専用の条件で拾う。
+CONE_EDGE_HSV = ((104, 130, 40), (122, 255, 255))  # 端に残る青のHSV範囲。
+CONE_EDGE_BAND_X = 0.12  # 左右の端から画像幅の12%だけを調べる。
+CONE_EDGE_START_Y = 0.64  # 衣類など画面上部の青を避け、画像高の64%より下だけを調べる。
+CONE_EDGE_TOUCH_X = 0.005  # 画面の外端から許す隙間。320画素幅では約2画素。
+CONE_EDGE_MIN_AREA_RATIO = 0.00007  # 青い断片の最小面積。320×240では6画素以上。
 
 
 def preprocess(imInput):
@@ -99,6 +105,27 @@ def locateEnemy(imInputHSV):
     return _legacy_result(_find_objects(mask, "enemy"), mask)
 
 
+def _cone_edge_fragments(imInput):
+    """画面端にわずかに残る青を、通常のコーン候補とは別に返す。"""
+    height, width = imInput.shape[:2]
+    band = max(1, round(width * CONE_EDGE_BAND_X))
+    start_y = int(height * CONE_EDGE_START_Y)
+    tolerance = round(width * CONE_EDGE_TOUCH_X)
+    min_pixels = max(3, int(np.ceil(width * height * CONE_EDGE_MIN_AREA_RATIO)))
+    sides = []
+    strips = (("left", imInput[start_y:, :band]),
+              ("right", imInput[start_y:, -band:][:, ::-1]))
+    for side, strip in strips:
+        # 右側は反転し、どちらも座標0を画像の外端とする。細い断片を残すため平滑化しない。
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, *CONE_EDGE_HSV)
+        _, _, components, _ = cv2.connectedComponentsWithStats(mask)
+        if any(x <= tolerance and x + w < band and h >= 2 and area >= min_pixels
+               for x, _, w, h, area in components[1:]):
+            sides.append(side)
+    return tuple(sides)
+
+
 def observe(imInput):
     """1枚のBGR画像をまとめて解析する。既存の3関数の引数は変更しない。"""
     hsv = preprocess(imInput)
@@ -115,6 +142,7 @@ def observe(imInput):
         "width": imInput.shape[1], "height": imInput.shape[0],
         "flag": found["flag"][0] if found["flag"] else None,
         "obstacles": found["obstacle"], "cones": found["cone"],
+        "cone_edges": _cone_edge_fragments(imInput),
         "enemies": found["enemy"], "masks": masks,
         "motion_gray": cv2.resize(gray, (64, 48)).astype(np.float32) / 255,
         "motion_mask": cv2.resize(colored, (64, 48),
