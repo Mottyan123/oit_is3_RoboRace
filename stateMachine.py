@@ -29,19 +29,23 @@ SEARCH_SECONDS = 5.0  # 目標を見失ったときに左右を探索する時�
 STALL_SECONDS = 2.5  # 前進指令中に移動の証拠が得られず、復帰を試すまでの時間（秒）。
 MAX_RECOVERIES = 3  # 同じコース段階での復帰試行回数の上限。段階が変わるとリセット。
 PASS_CLEAR_SECONDS = 0.4  # 物体が側方に抜け始めてから、通過と判断するまでの最低時間（秒）。
-OBSTACLE_CLEARANCE_X = 0.08  # 緑円柱の外縁から取る余裕。初期値は目前の接触判定と同じく中央の左右8%。
+OBSTACLE_CLEARANCE_X = 0.10  # 発進時・手前の緑円柱の外縁から取る余裕。画像幅の10%。
+FAR_OBSTACLE_CLEARANCE_X = 0.10  # 試走1では奥の円柱に寄ったため、この区間だけ外縁から画像幅の10%を取る。
 OBSTACLE_PASS_BOTTOM = 0.90  # 横に十分離れた円柱の下端がこの高さを超えたら、通過の確認を始める。
-CONE_SIDE_MARGIN_X = 0.05  # コーンの外縁と進路中心の余裕。画像幅の12%。小さいほどコース中央寄りを通る。
+CONE_SIDE_MARGIN_X = 0.05  # コーンの外縁と進路中心の余裕。画像幅の5%。小さいほどコース中央寄りを通る。
 CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する最低時間（秒）。SLOW_DUTYで試走して調整する。
 
 # ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
 GOAL_NEAR_AREA = 0.025  # 面積比2.5%。減速と、赤を見失う直前に十分近かったかの判定に使う。
 GOAL_CREEP_AREA = 0.065  # 面積比6.5%。赤が中央付近にあれば微速進入に切り替える。
 # ゴール位置では赤が視野から外れる。最後の前進時間は、下のPWMで実機を走らせて測る。
-GOAL_FINAL_ADVANCE_SECONDS = None  # 消失後に前進する時間（秒）。未設定（None）なら停止。
-GOAL_FINAL_DUTY = 100.0  # 赤を近接で見失った後の前進の基本PWM（%）。変更したら時間も測り直す。
+GOAL_FINAL_ADVANCE_SECONDS = 0.5  # 赤が視野外に出た後の直進時間（秒）。未設定（None）なら停止。
+GOAL_FINAL_DUTY = 80.0  # 赤の消失直後に加速しないよう、見えている区間と同じPWM（%）で試す。
 GOAL_FINAL_MAX_SECONDS = 1.0  # 視野外での前進時間に設定できる上限（秒）。
-GOAL_CREEP_LIMIT = 1.0  # 赤がまだ見える微速区間の上限（秒）。停止して観測する時間も含む。
+# 試走1では黒丸が手前に見えたまま、微速進入を始めて約1秒で停止した。
+GOAL_CREEP_LIMIT = 6.0  # 赤が見える微速区間の上限（秒）。停止して観測する時間も含む。
+GOAL_CREEP_PERIOD_SECONDS = 0.35  # 前進と停止を合わせた1周期の長さ（秒）。
+GOAL_CREEP_MOVE_SECONDS = 0.22  # 1周期の先頭で前進する時間（秒）。旧0.12秒より走行距離を増やす。
 
 
 def _target_x(info):
@@ -263,12 +267,12 @@ class RaceController:
                    default=None)
 
     @staticmethod
-    def _obstacle_target(obj, side):
+    def _obstacle_target(obj, side, clearance):
         # 円柱と余裕を含む範囲から、画面中央（現在の進行方向）を外すための最小限の舵。
         # すでに中央が空いていれば、左右どちらに回避中でも0.5に戻して直進する。
         if side == "left":
-            return max(0.08, min(0.5, obj["left"] - OBSTACLE_CLEARANCE_X))
-        return min(0.92, max(0.5, obj["right"] + OBSTACLE_CLEARANCE_X))
+            return max(0.08, min(0.5, obj["left"] - clearance))
+        return min(0.92, max(0.5, obj["right"] + clearance))
 
     def _pass_object(self, objects, next_stage, now):
         """接近・側方への移動・前進の証拠をそろえて通過を推定する。"""
@@ -294,7 +298,9 @@ class RaceController:
             # 左を通ると物体は右端の22%に入り、右を通ると左端の22%に入る。
             at_edge = (obj["x"] > 0.78 if track["side"] == "left"
                        else obj["x"] < 0.22)
-            x = self._obstacle_target(obj, track["side"])
+            clearance = (FAR_OBSTACLE_CLEARANCE_X if self.stage == "FAR_OBSTACLE"
+                         else OBSTACLE_CLEARANCE_X)
+            x = self._obstacle_target(obj, track["side"], clearance)
             # 横に余裕がある円柱は、画面下端から見切れることもある。
             at_edge = x == 0.5 and (at_edge or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
             if x != 0.5:
@@ -420,10 +426,10 @@ class RaceController:
             self.stop("赤を見失った。最終前進時間が未校正のため停止")
             return self.command
         if self.final_driven_seconds >= duration:
-            self.stop("校正した最終前進を完了。ゴール到達は推定（eで停止）")
+            self.stop("設定時間の最終前進を完了。ゴール到達は推定（eで停止）")
             self.phase = "GOAL_HOLD"
             return self.command
-        self.reason = "赤は視野外。校正した短い最終前進"
+        self.reason = "赤は視野外。設定時間だけ最終前進"
         return self._drive_toward(0.5, GOAL_FINAL_DUTY)
 
     def _goal(self, flag, now):
@@ -473,9 +479,9 @@ class RaceController:
         if elapsed >= GOAL_CREEP_LIMIT:
             self.stop("赤が見える区間の微速進入上限。到達未確認")
             return self.command
-        # 0.35秒を1周期として、最初の0.12秒だけ前進し、残りの時間は停止して観測する。
+        # 各周期の先頭で前進し、残りの時間は停止して観測する。
         self.reason = "ゴール微速進入（到達は画像による推定）"
-        if elapsed % 0.35 >= 0.12:
+        if elapsed % GOAL_CREEP_PERIOD_SECONDS >= GOAL_CREEP_MOVE_SECONDS:
             return 0.0, 0.0
         return self._drive_toward(flag["x"], SLOW_DUTY)
 
@@ -579,7 +585,8 @@ class RaceController:
                 # 発進直後も眼前の円柱を優先し、進路が空いていればそのまま直進する。
                 obj = self._nearest(scene["obstacles"])
                 side = "left" if obj["x"] >= 0.5 else "right"
-                command = self._drive_toward(self._obstacle_target(obj, side), SLOW_DUTY)
+                x = self._obstacle_target(obj, side, OBSTACLE_CLEARANCE_X)
+                command = self._drive_toward(x, SLOW_DUTY)
             elif flag:
                 command = self._drive_toward(flag["x"], DRIVE_DUTY)
             else:
