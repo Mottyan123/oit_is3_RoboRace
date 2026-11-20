@@ -31,6 +31,8 @@ MAX_RECOVERIES = 3  # 同じコース段階での復帰試行回数の上限。�
 PASS_CLEAR_SECONDS = 0.4  # 物体が側方に抜け始めてから、通過と判断するまでの最低時間（秒）。
 OBSTACLE_CLEARANCE_X = 0.08  # 緑円柱の外縁から取る余裕。初期値は目前の接触判定と同じく中央の左右8%。
 OBSTACLE_PASS_BOTTOM = 0.90  # 横に十分離れた円柱の下端がこの高さを超えたら、通過の確認を始める。
+CONE_SIDE_MARGIN_X = 0.16  # コーンの外縁から確保する横方向の余裕。画像幅に対する割合。
+CONE_CLEAR_SECONDS = 1.0  # コーンが視野から消えた後に直進する最低時間（秒）。SLOW_DUTYで試走して調整する。
 
 # ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
 GOAL_NEAR_AREA = 0.025  # 面積比2.5%。減速と、赤を見失う直前に十分近かったかの判定に使う。
@@ -102,6 +104,8 @@ class RaceController:
         self.last_enemy = -math.inf
         self.enemy_until = -math.inf
         self.track = None
+        self.cone_clear_elapsed = None  # コーンが消えてから直進した時間。Noneは消失をまだ確認していない状態。
+        self.cone_evidence_at_loss = 0
         self.search_started = None
         self.recovery = None
         self.recoveries = 0
@@ -192,6 +196,7 @@ class RaceController:
         if self.track:
             self.track["edge_at"] = None
             self.track["evidence_at_edge"] = self.forward_evidence
+        self.cone_clear_elapsed = None
         self.last_progress = now
         self.check_deadline(now)
 
@@ -265,11 +270,11 @@ class RaceController:
             return max(0.08, min(0.5, obj["left"] - OBSTACLE_CLEARANCE_X))
         return min(0.92, max(0.5, obj["right"] + OBSTACLE_CLEARANCE_X))
 
-    def _pass_object(self, objects, next_stage, scene, now, forced_side=None):
+    def _pass_object(self, objects, next_stage, now):
         """接近・側方への移動・前進の証拠をそろえて通過を推定する。"""
         obj = self._nearest(objects)
         if self.track is None and obj is not None:
-            side = forced_side or ("left" if obj["x"] >= 0.5 else "right")
+            side = "left" if obj["x"] >= 0.5 else "right"
             self.track = {"object": obj, "side": side, "near": False,
                           "edge_at": None, "evidence_at_edge": 0}
         track = self.track
@@ -289,18 +294,11 @@ class RaceController:
             # 左を通ると物体は右端の22%に入り、右を通ると左端の22%に入る。
             at_edge = (obj["x"] > 0.78 if track["side"] == "left"
                        else obj["x"] < 0.22)
-            if forced_side:
-                # 青コーンは指定側へ向けて従来どおり操舵する。
-                x = (obj["left"] - 0.16 if track["side"] == "left"
-                     else obj["right"] + 0.16)
-                x = min(0.92, max(0.08, x))
-            else:
-                x = self._obstacle_target(obj, track["side"])
-                # 横に余裕がある円柱は、画面下端から見切れることもある。
-                # 端まで振る必要はない。消失後の経過時間と前進の証拠は引き続き確認する。
-                at_edge = x == 0.5 and (at_edge or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
-                if x != 0.5:
-                    track["edge_at"] = None  # 円柱が進路に戻ったら通過の確認をやり直す。
+            x = self._obstacle_target(obj, track["side"])
+            # 横に余裕がある円柱は、画面下端から見切れることもある。
+            at_edge = x == 0.5 and (at_edge or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
+            if x != 0.5:
+                track["edge_at"] = None  # 円柱が進路に戻ったら通過の確認をやり直す。
             if track["near"] and at_edge and track["edge_at"] is None:
                 track["edge_at"] = now
                 track["evidence_at_edge"] = self.forward_evidence
@@ -314,8 +312,53 @@ class RaceController:
         if obj is None and track["near"] and track["edge_at"] is None:
             self.reason = "接近対象を前方で喪失。通過と決めつけず停止"
             return (0.0, 0.0)
-        self.reason = "指定側でコーン通過" if forced_side else "緑円柱を回避"
+        self.reason = "緑円柱を回避"
         return self._drive_toward(x, SLOW_DUTY)
+
+    def _pass_cone(self, cones, now, dt):
+        """指定側へ進入し、コーンが視野外に出た後も後部が抜けるまで直進する。"""
+        cone = self._nearest(cones)
+        if cone is not None:
+            # コーンが再び見えたら、消失後の直進時間は最初から数える。
+            self.cone_clear_elapsed = None
+            if self.route == "left":
+                boundary = cone["left"] - CONE_SIDE_MARGIN_X
+                clear_side = boundary >= 0.5  # コーンの左端が進路より十分右にある。
+            else:
+                boundary = cone["right"] + CONE_SIDE_MARGIN_X
+                clear_side = boundary <= 0.5
+            if self.stage == "CENTER_CLEAR":
+                if not clear_side:
+                    self.reason = "コーンが直進範囲に入ったため停止"
+                    return 0.0, 0.0
+            else:
+                near = cone["bottom"] > 0.65 and cone["height"] > 0.16
+                if not (near and clear_side):
+                    self.stage = "CENTER_PASS"
+                    self.reason = "指定側でコーンに進入"
+                    # 進入時の余裕幅は従来と同じ。余裕がある場合はコーン側へ切り込まない。
+                    x = 0.5 if clear_side else min(0.92, max(0.08, boundary))
+                    return self._drive_toward(x, SLOW_DUTY)
+                self._change_stage("CENTER_CLEAR", now)
+        elif self.stage == "CENTER_APPROACH":
+            return None  # まだコーンを見ていない間は、通常の追従で接近する。
+        elif self.stage != "CENTER_CLEAR":
+            self.reason = "コーンの側方を確認できず停止。再検出を待つ"
+            return 0.0, 0.0
+        else:
+            if self.cone_clear_elapsed is None or dt > IMAGE_MAX_AGE:
+                # 消失を最初に観測した時点を起点にする。それ以前の時間は含めない。
+                self.cone_clear_elapsed = 0.0
+                self.cone_evidence_at_loss = self.forward_evidence
+            elif min(self.command) > 0:
+                self.cone_clear_elapsed += dt  # 直前の指令が前進の場合だけ時間を足す。
+            if (self.cone_clear_elapsed >= CONE_CLEAR_SECONDS and
+                    self.forward_evidence - self.cone_evidence_at_loss >= 2):
+                self._change_stage("FAR_OBSTACLE", now)
+                return 0.0, 0.0  # 次の画像から奥の障害物に向けて操舵する。
+
+        self.reason = "コーンの横を直進。車体後部が抜けるまで進路を維持"
+        return self._drive_toward(0.5, SLOW_DUTY)
 
     def _search(self, now):
         if self.search_started is None:
@@ -467,6 +510,10 @@ class RaceController:
             self.track = None
             self.recovery = None
             self.search_started = None
+            if self.stage == "CENTER_CLEAR":
+                # 手動の間に姿勢が変わり得るので、再開時はコーンの側方を確かめ直す。
+                self.stage = "CENTER_PASS"
+                self.cone_clear_elapsed = None
             if self.check_deadline(now):
                 return self.command
         if self.phase != "RUNNING":
@@ -497,6 +544,7 @@ class RaceController:
             # 相手による遮蔽中に通過時間だけを消費しない。
             if self.track:
                 self.track["edge_at"] = None
+            self.cone_clear_elapsed = None
             return self.command
         if self.recovery:
             self.command = self._recover(now)
@@ -504,7 +552,10 @@ class RaceController:
         if (self.stage not in ("GOAL_CREEP", "GOAL_FINAL") and
                 self.search_started is None and min(self.command) > 0 and
                 now - self.last_progress >= STALL_SECONDS):
-            self._begin_recovery(scene, now)
+            if self.stage == "CENTER_CLEAR":
+                self.stop("コーンの横で前進を確認できないため停止")
+            else:
+                self._begin_recovery(scene, now)
             return self.command
         self.search_started = None if flag else self.search_started
         if self.stage == "START_EXIT":
@@ -513,12 +564,9 @@ class RaceController:
                 self._change_stage("NEAR_OBSTACLE", now)
         if self.stage in ("NEAR_OBSTACLE", "FAR_OBSTACLE"):
             next_stage = "CENTER_APPROACH" if self.stage == "NEAR_OBSTACLE" else "GOAL_ALIGN"
-            command = self._pass_object(scene["obstacles"], next_stage, scene, now)
-        elif self.stage in ("CENTER_APPROACH", "CENTER_PASS"):
-            if scene["cones"]:
-                self.stage = "CENTER_PASS"
-            command = self._pass_object(scene["cones"], "FAR_OBSTACLE", scene,
-                                        now, forced_side=self.route)
+            command = self._pass_object(scene["obstacles"], next_stage, now)
+        elif self.stage in ("CENTER_APPROACH", "CENTER_PASS", "CENTER_CLEAR"):
+            command = self._pass_cone(scene["cones"], now, dt)
         elif self.stage.startswith("GOAL_"):
             command = self._goal(flag, now)
         else:
