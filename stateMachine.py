@@ -2,34 +2,44 @@
 import math
 import numpy as np
 
-# 元からある動作名と関数の引数は維持する。
+# 基本動作の識別番号。順に停止・前進・後退・右旋回・左旋回を表す。
 IDLE, FORWARD, BACKWARD, RIGHT, LEFT = 0, 1, 2, 3, 4
 
-# 以下は実測値ではなく、低速試走を始めるための調整値。
-RACE_SECONDS = 180.0
-STOP_MARGIN = 0.2
-DRIVE_DUTY = 55.0
-SLOW_DUTY = 38.0
-TURN_DUTY = 35.0
-MANUAL_DUTY = 60.0
-STEER_GAIN = 35.0
-MAX_DUTY = 75.0
-LEFT_TRIM = 0.0
-RIGHT_TRIM = 0.0
-IMAGE_MAX_AGE = 0.5
-ENEMY_HOLD_SECONDS = 1.0
-SEARCH_SECONDS = 5.0
-STALL_SECONDS = 2.5
-MAX_RECOVERIES = 3
-PASS_CLEAR_SECONDS = 0.4
-GOAL_NEAR_AREA = 0.025
-GOAL_CREEP_AREA = 0.065
-# ゴール位置では赤は見えない。最後に見失った位置からの前進時間を校正する。
-# Noneの間は見失った時点で停止する。距離を推測して押し込まない。
-GOAL_FINAL_ADVANCE_SECONDS = None
-GOAL_FINAL_DUTY = 38.0
-GOAL_FINAL_MAX_SECONDS = 1.0
-GOAL_CREEP_LIMIT = 1.0
+# 自律走行の時間設定（秒）。手動モードは制限時間の対象外。
+# 開始から RACE_SECONDS - STOP_MARGIN 秒で停止指令を出す。
+RACE_SECONDS = 180.0  # 競技の制限時間。
+STOP_MARGIN = 0.2  # 監視周期や車体が止まるまでの遅れを見込んで早めに止める時間。
+
+# モータへのPWM指令。0～100%のデューティ比で、実際の速度は機体によって異なる。
+# 走行用の値は低速試走の初期値。実機で動き出す最低PWMも確認して調整する。
+DRIVE_DUTY = 100.0  # 自律走行で通常前進するときの基本PWM（%）。
+SLOW_DUTY = 80.0  # 障害物回避・ゴール接近・復帰時の短い後退に使うPWM（%）。
+TURN_DUTY = 80.0  # 左右のモータを逆向きに回す旋回のPWM（%）。手動と自律で共通。
+MANUAL_DUTY = 100.0  # 手動で前進・後退するときのPWM（%）。
+STEER_GAIN = 10.0  # 目標の横ずれが最大のとき、片側に足し引きするPWMのポイント数。大きいほど強く曲がる。
+MAX_DUTY = 100.0  # 左右それぞれの出力上限（%）。手動時の出力にも適用される。
+LEFT_TRIM = 0.0  # 自律で目標を追うときの左モータ補正。正なら左PWMを増やす（ポイント）。
+RIGHT_TRIM = 0.0  # 自律で目標を追うときの右モータ補正。正なら右PWMを増やす（ポイント）。
+
+# 画像の有効期限、待機・復帰・通過の設定。
+# 画像の座標は左端・上端を0、右端・下端を1とする。物体の高さや面積も画像全体に対する割合で扱う。
+IMAGE_MAX_AGE = 0.5  # 画像取得から判断までの許容時間（秒）。最終進入の更新間隔・赤の消失判定にも使う。
+ENEMY_HOLD_SECONDS = 1.0  # 進路上の相手を最後に検出してから停止を続ける時間（秒）。
+SEARCH_SECONDS = 5.0  # 目標を見失ったときに左右を探索する時間の上限（秒）。
+STALL_SECONDS = 2.5  # 前進指令中に移動の証拠が得られず、復帰を試すまでの時間（秒）。
+MAX_RECOVERIES = 3  # 同じコース段階での復帰試行回数の上限。段階が変わるとリセット。
+PASS_CLEAR_SECONDS = 0.4  # 物体が側方に抜け始めてから、通過と判断するまでの最低時間（秒）。
+OBSTACLE_CLEARANCE_X = 0.08  # 緑円柱の外縁から取る余裕。初期値は目前の接触判定と同じく中央の左右8%。
+OBSTACLE_PASS_BOTTOM = 0.90  # 横に十分離れた円柱の下端がこの高さを超えたら、通過の確認を始める。
+
+# ゴールの判定に使う面積は「赤い輪郭の面積 ÷ 処理画像全体の面積」。
+GOAL_NEAR_AREA = 0.025  # 面積比2.5%。減速と、赤を見失う直前に十分近かったかの判定に使う。
+GOAL_CREEP_AREA = 0.065  # 面積比6.5%。赤が中央付近にあれば微速進入に切り替える。
+# ゴール位置では赤が視野から外れる。最後の前進時間は、下のPWMで実機を走らせて測る。
+GOAL_FINAL_ADVANCE_SECONDS = None  # 消失後に前進する時間（秒）。未設定（None）なら停止。
+GOAL_FINAL_DUTY = 100.0  # 赤を近接で見失った後の前進の基本PWM（%）。変更したら時間も測り直す。
+GOAL_FINAL_MAX_SECONDS = 1.0  # 視野外での前進時間に設定できる上限（秒）。
+GOAL_CREEP_LIMIT = 1.0  # 赤がまだ見える微速区間の上限（秒）。停止して観測する時間も含む。
 
 
 def _target_x(info):
@@ -51,9 +61,11 @@ def stateMachine(sState, vFlagInfo, vEnemyInfo):
     enemy_x = _target_x(vEnemyInfo)
     if x is None:
         return IDLE
+    # xは画像左端が0、中央が0.5、右端が1。中央から左右25%幅に相手がいれば停止。
     if enemy_x is not None and abs(enemy_x - 0.5) < 0.25:
         return IDLE
-    # 旋回開始と終了の幅を変えると、境界付近の左右の震えを減らせる。
+    # 目標が中央から5%幅を超えてずれると旋回し、2%幅以内まで戻ると前進する。
+    # 開始と終了の幅を分けると、境界付近で前進と旋回を繰り返しにくい。
     tolerance = 0.02 if sState in (LEFT, RIGHT) else 0.05
     if x > 0.5 + tolerance:
         return RIGHT
@@ -184,6 +196,7 @@ class RaceController:
         self.check_deadline(now)
 
     def _motion_changed(self, scene, now):
+        # 移動の比較は最短0.15秒ごと。直前のフレームとの差が小さすぎるのを防ぐ。
         if (self.last_motion_sample is not None and
                 now - self.last_motion_sample < 0.15):
             return False
@@ -194,6 +207,8 @@ class RaceController:
         changed = False
         if self.previous_gray is not None:
             valid = mask & self.previous_mask
+            # 両画像で比較できる背景が200画素を超える場合だけ調べる。
+            # 明るさは0～1。平均の差が0.018（明るさの全範囲の1.8%）を超えたら移動の証拠にする。
             if np.count_nonzero(valid) > 200:
                 difference = np.abs(gray - self.previous_gray)
                 changed = bool(np.mean(difference[valid]) > 0.018)
@@ -204,9 +219,9 @@ class RaceController:
 
     def _drive_toward(self, x, duty):
         self.motion = stateMachine(self.motion, {"x": x}, None)
-        error = (x - 0.5) * 2
+        error = (x - 0.5) * 2  # 中央からのずれを左端-1、右端+1に換算する。
         turn = STEER_GAIN * error
-        base = duty * (1 - 0.35 * abs(error))
+        base = duty * (1 - 0.35 * abs(error))  # ずれが大きいほど減速し、端では基本PWMを35%下げる。
         # 通常の追従では後退させず、前進の左右差で曲がる。
         left = min(MAX_DUTY, max(0, base + turn + LEFT_TRIM))
         right = min(MAX_DUTY, max(0, base - turn + RIGHT_TRIM))
@@ -229,8 +244,9 @@ class RaceController:
     def _enemy_blocks(self, scene, now):
         for enemy in scene["enemies"]:
             self.last_enemy = now
-            # 目印より車体の方が広いので、黄色領域の両側に余裕を足す。
+            # 黄色い領域が画像幅の28～72%に重なれば、進路にかかるとみなす。
             overlaps = enemy["left"] < 0.72 and enemy["right"] > 0.28
+            # 目印が画像の高さの8%、または画像全体の面積の0.6%を超えたら近いとみなす。
             near = enemy["height"] > 0.08 or enemy["area"] > 0.006
             if overlaps and near:
                 self.enemy_until = now + ENEMY_HOLD_SECONDS
@@ -240,6 +256,14 @@ class RaceController:
     def _nearest(objects):
         return max(objects, key=lambda obj: obj["bottom"] + obj["height"],
                    default=None)
+
+    @staticmethod
+    def _obstacle_target(obj, side):
+        # 円柱と余裕を含む範囲から、画面中央（現在の進行方向）を外すための最小限の舵。
+        # すでに中央が空いていれば、左右どちらに回避中でも0.5に戻して直進する。
+        if side == "left":
+            return max(0.08, min(0.5, obj["left"] - OBSTACLE_CLEARANCE_X))
+        return min(0.92, max(0.5, obj["right"] + OBSTACLE_CLEARANCE_X))
 
     def _pass_object(self, objects, next_stage, scene, now, forced_side=None):
         """接近・側方への移動・前進の証拠をそろえて通過を推定する。"""
@@ -251,21 +275,36 @@ class RaceController:
         track = self.track
         if track is None:
             return None
+        x = 0.5  # 対象がいったん消えた場合は、それまでの方位を保つ。
         if obj is not None:
             previous = track["object"]
-            # 遠方にある別の緑円柱へ追跡対象を乗り換えない。
+            # 中心が画像幅の30%を超えて跳ぶか、高さが前回の半分未満なら別の物体とみなす。
             if (abs(obj["x"] - previous["x"]) > 0.3 or
                     obj["height"] < previous["height"] * 0.5):
                 obj = None
         if obj is not None:
             track["object"] = obj
+            # 物体の下端が画像の縦65%より下で、高さが画像の16%を超えたら接近済みと記録。
             track["near"] |= obj["bottom"] > 0.65 and obj["height"] > 0.16
+            # 左を通ると物体は右端の22%に入り、右を通ると左端の22%に入る。
             at_edge = (obj["x"] > 0.78 if track["side"] == "left"
                        else obj["x"] < 0.22)
+            if forced_side:
+                # 青コーンは指定側へ向けて従来どおり操舵する。
+                x = (obj["left"] - 0.16 if track["side"] == "left"
+                     else obj["right"] + 0.16)
+                x = min(0.92, max(0.08, x))
+            else:
+                x = self._obstacle_target(obj, track["side"])
+                # 横に余裕がある円柱は、画面下端から見切れることもある。
+                # 端まで振る必要はない。消失後の経過時間と前進の証拠は引き続き確認する。
+                at_edge = x == 0.5 and (at_edge or obj["bottom"] > OBSTACLE_PASS_BOTTOM)
+                if x != 0.5:
+                    track["edge_at"] = None  # 円柱が進路に戻ったら通過の確認をやり直す。
             if track["near"] and at_edge and track["edge_at"] is None:
                 track["edge_at"] = now
                 track["evidence_at_edge"] = self.forward_evidence
-        previous = track["object"]
+        # 物体の消失と経過時間に加え、側方に抜け始めた後の前進の証拠が2回以上必要。
         passed = (obj is None and track["edge_at"] is not None and
                   now - track["edge_at"] >= PASS_CLEAR_SECONDS and
                   self.forward_evidence - track["evidence_at_edge"] >= 2)
@@ -275,12 +314,6 @@ class RaceController:
         if obj is None and track["near"] and track["edge_at"] is None:
             self.reason = "接近対象を前方で喪失。通過と決めつけず停止"
             return (0.0, 0.0)
-        # 見えている物体の外縁より外に目標を置き、車体幅分の余裕を取る。
-        x = previous["left"] - 0.16 if track["side"] == "left" else previous["right"] + 0.16
-        x = min(0.92, max(0.08, x))
-        if obj is None:
-            # 消失後は以前の強い舵を続けず、短い直進で通過の証拠を確認。
-            x = 0.5
         self.reason = "指定側でコーン通過" if forced_side else "緑円柱を回避"
         return self._drive_toward(x, SLOW_DUTY)
 
@@ -291,7 +324,7 @@ class RaceController:
         if elapsed >= SEARCH_SECONDS:
             self.stop("探索上限。目標を再取得できないため停止")
             return self.command
-        # 最初は最後に見た側、その後は左右を交互に小さく探す。
+        # 最初は目標を最後に見た側へ向き、その後は0.8秒ごとに旋回方向を変える。
         side = "right" if self.last_goal_x > 0.5 else "left"
         if int(elapsed / 0.8) % 2:
             side = "left" if side == "right" else "right"
@@ -303,11 +336,13 @@ class RaceController:
         if self.recoveries > MAX_RECOVERIES:
             self.stop("自己復帰回数の上限")
             return
-        # 後方センサはない。最近まっすぐ通った区間の証拠があるときだけ戻る。
+        # 直進の証拠が3秒以内にあり、直近2秒に大きな旋回、直近3秒に相手の検出がなければ短く後退できる。
+        # 出発直後は自分側のポールが後ろにあるため、後退の候補から外す。
         rear_evidence = (self.stage != "START_EXIT" and
                          now - self.last_clear_motion < 3.0 and
                          now - self.last_turn > 2.0 and
                          now - self.last_enemy > 3.0)
+        # 物体の下端が画像の縦80%より下なら、付近に障害物があるとみなす。
         nearby = any(obj["bottom"] > 0.8 for obj in
                      scene["obstacles"] + scene["cones"])
         if nearby and not rear_evidence:
@@ -319,11 +354,11 @@ class RaceController:
 
     def _recover(self, now):
         elapsed = now - self.recovery["started"]
-        if elapsed < 0.15:
+        if elapsed < 0.15:  # 復帰開始から0.15秒間は停止。
             return 0.0, 0.0
-        if self.recovery["reverse"] and elapsed < 0.33:
+        if self.recovery["reverse"] and elapsed < 0.33:  # 後退できる場合は開始0.33秒まで後退。
             return -SLOW_DUTY, -SLOW_DUTY
-        if elapsed < 0.75:
+        if elapsed < 0.75:  # 開始0.75秒まで旋回。失敗が続いたら試行ごとに向きを変える。
             side = self.route
             if self.recoveries % 2 == 0:
                 side = "left" if side == "right" else "right"
@@ -355,6 +390,7 @@ class RaceController:
                 return 0.0, 0.0
             return self._final_goal()
         if flag is None:
+            # 近接と整列を3回以上確認し、最後の赤が中央から7%幅未満で、観測も新しければ最終進入へ。
             near_and_aligned = (self.near_goal_confirmations >= 3 and
                                 self.last_goal_area >= GOAL_NEAR_AREA and
                                 abs(self.last_goal_x - 0.5) < 0.07 and
@@ -371,15 +407,17 @@ class RaceController:
                 return self.command
             return self._search(now)
         error = abs(flag["x"] - 0.5)
+        # 中央から7%幅未満で近接面積も満たすフレームを数える。外れたら数え直す。
         if flag["area"] >= GOAL_NEAR_AREA and error < 0.07:
             self.near_goal_confirmations += 1
         else:
             self.near_goal_confirmations = 0
         if self.stage == "GOAL_ALIGN":
-            if error < 0.05:
+            if error < 0.05:  # 最初の整列は中央から5%幅未満で完了。
                 self._change_stage("GOAL_APPROACH", now)
             return self._drive_toward(flag["x"], SLOW_DUTY)
         if self.stage == "GOAL_APPROACH":
+            # 微速進入には面積条件に加え、目標が中央から7%幅未満にあることが必要。
             if flag["area"] >= GOAL_CREEP_AREA and error < 0.07:
                 self._change_stage("GOAL_CREEP", now)
                 self.creep_started = now
@@ -389,7 +427,7 @@ class RaceController:
         if elapsed >= GOAL_CREEP_LIMIT:
             self.stop("赤が見える区間の微速進入上限。到達未確認")
             return self.command
-        # 短く進み、止まって観測する。sleepで入力処理を止めない。
+        # 0.35秒を1周期として、最初の0.12秒だけ前進し、残りの時間は停止して観測する。
         self.reason = "ゴール微速進入（到達は画像による推定）"
         if elapsed % 0.35 >= 0.12:
             return 0.0, 0.0
@@ -437,10 +475,11 @@ class RaceController:
         if moving and min(self.command) > 0:
             self.forward_evidence += 1
             self.last_progress = now
+            # 左右のPWM差が10ポイント未満で、相手・円柱・コーンが見えなければ直進を記録する。
             if abs(self.command[0] - self.command[1]) < 10:
                 if not scene["enemies"] and not scene["obstacles"] and not scene["cones"]:
                     self.last_clear_motion = now
-        if abs(self.command[0] - self.command[1]) > 15:
+        if abs(self.command[0] - self.command[1]) > 15:  # 15ポイントを超える差は大きな旋回の指令とみなす。
             self.last_turn = now
         flag = scene["flag"]
         if flag:
@@ -469,6 +508,7 @@ class RaceController:
             return self.command
         self.search_started = None if flag else self.search_started
         if self.stage == "START_EXIT":
+            # 発進から0.4秒以上経ち、前進の証拠が2回以上あれば次の段階へ進む。
             if self.forward_evidence >= 2 and now - self.stage_entered >= 0.4:
                 self._change_stage("NEAR_OBSTACLE", now)
         if self.stage in ("NEAR_OBSTACLE", "FAR_OBSTACLE"):
@@ -484,16 +524,16 @@ class RaceController:
         else:
             command = None
         if command is None:
-            if flag:
-                command = self._drive_toward(flag["x"], DRIVE_DUTY)
-            elif self.stage == "START_EXIT" and scene["obstacles"]:
-                # 遠方の赤が小さくても、見えている手前円柱を避けて離脱できる。
+            if self.stage == "START_EXIT" and scene["obstacles"]:
+                # 発進直後も眼前の円柱を優先し、進路が空いていればそのまま直進する。
                 obj = self._nearest(scene["obstacles"])
-                x = obj["left"] - 0.16 if obj["x"] >= 0.5 else obj["right"] + 0.16
-                command = self._drive_toward(min(0.92, max(0.08, x)), SLOW_DUTY)
+                side = "left" if obj["x"] >= 0.5 else "right"
+                command = self._drive_toward(self._obstacle_target(obj, side), SLOW_DUTY)
+            elif flag:
+                command = self._drive_toward(flag["x"], DRIVE_DUTY)
             else:
                 command = self._search(now)
-        # 通過対象以外の目前の物体も、進路上なら停止する。
+        # 下端が画像の縦92%より下、高さが20%超で、横42～58%の進路に重なる物体があれば停止。
         near_objects = scene["obstacles"] + scene["cones"]
         center_blocked = any(obj["bottom"] > 0.92 and obj["height"] > 0.2 and
                              obj["left"] < 0.58 and obj["right"] > 0.42
