@@ -62,3 +62,5 @@ python3 roboNavi.py
 | [`locateTarget.py`](locateTarget.py) | 目印の色・形・位置を画像から検出 | [PDF](docs/locateTarget/locateTarget_flowchart.pdf) | [PDF](docs/locateTarget/locateTarget_specification.pdf) |
 | [`stateMachine.py`](stateMachine.py) | 走行段階の管理、回避・停止の判断、左右のPWM計算 | [PDF](docs/stateMachine/stateMachine_flowchart.pdf) | [PDF](docs/stateMachine/stateMachine_specification.pdf) |
 | [`ClsDualMotorControl.py`](ClsDualMotorControl.py) | GPIOで方向・待機信号とPWMを操作 | [PDF](docs/ClsDualMotorControl/ClsDualMotorControl_flowchart.pdf) | [PDF](docs/ClsDualMotorControl/ClsDualMotorControl_specification.pdf) |
+
+4本のスクリプトの処理図と説明を、進捗レポート用紙の表裏にまとめています。 [進捗レポートの記入例（A4・2ページ）](docs/report/roborace_progress_report.pdf)
