@@ -25,6 +25,13 @@ CONE_EDGE_START_Y = 0.64  # 衣類など画面上部の青を避け、画像高�
 CONE_EDGE_TOUCH_X = 0.005  # 画面の外端から許す隙間。320画素幅では約2画素。
 CONE_EDGE_MIN_AREA_RATIO = 0.00007  # 青い断片の最小面積。320×240では6画素以上。
 
+# ゴール調整画像1.pngでは、黒い台座が画面下部の横長の塊として映る。
+GOAL_BASE_HSV_MAX = (179, 145, 85)  # 色相は問わず、彩度145・明度85以下を黒の候補にする。
+GOAL_BASE_FLOOR_Y = 0.60  # 画像高の60%より下にある台座を探す。背景の暗い物を減らす。
+GOAL_BASE_MIN_WIDTH = 0.08  # 画像幅の8%未満の小さい影や脚を除く。
+GOAL_BASE_ASPECT = (1.8, 7.0)  # 台座候補として残す横幅÷高さの範囲。
+GOAL_BASE_MIN_FILL = 0.55  # 外接矩形の55%以上を輪郭が占めるものを残し、細いケーブルなどを除く。
+
 
 def preprocess(imInput):
     # HSVの赤は両端に分かれるため、色相を平均する前にBGR画像で平滑化する。
@@ -126,6 +133,26 @@ def _cone_edge_fragments(imInput):
     return tuple(sides)
 
 
+def _goal_bases(hsv):
+    height, width = hsv.shape[:2]
+    floor_y = int(height * GOAL_BASE_FLOOR_Y)
+    mask = cv2.inRange(hsv, (0, 0, 0), GOAL_BASE_HSV_MAX)
+    mask[:floor_y] = 0
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    bases = []
+    for obj in _find_objects(mask, "goal_base"):
+        x, y, w, h = obj["bbox"]
+        # 探索範囲の上端や画像の左右端で切れた輪郭は、形を判定できない。
+        if (y > floor_y and x > 0 and x + w < width and
+                w / width >= GOAL_BASE_MIN_WIDTH and
+                GOAL_BASE_ASPECT[0] <= w / h <= GOAL_BASE_ASPECT[1] and
+                obj["confidence"] >= GOAL_BASE_MIN_FILL):
+            bases.append(obj)
+    return bases
+
+
 def observe(imInput):
     """1枚のBGR画像をまとめて解析する。既存の3関数の引数は変更しない。"""
     hsv = preprocess(imInput)
@@ -141,6 +168,7 @@ def observe(imInput):
         "valid": bool(gray.std() > 2 and gray.mean() > 3),
         "width": imInput.shape[1], "height": imInput.shape[0],
         "flag": found["flag"][0] if found["flag"] else None,
+        "goal_bases": _goal_bases(hsv),
         "obstacles": found["obstacle"], "cones": found["cone"],
         "cone_edges": _cone_edge_fragments(imInput),
         "enemies": found["enemy"], "masks": masks,
